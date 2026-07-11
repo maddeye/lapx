@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 13 — Minimal Debug-Bedienung page</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 13 — Minimal Debug-Bedienung page</h1>
+<div class="meta"><span class="tag p1">P1</span><span class="tag">Delivery #13</span><span class="tag">Local integration</span><p>Prove the complete browser path with one static HTML file and vanilla JavaScript.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Serve /debug from the Rust process.</li><li>Use fetch for command POSTs and EventSource for state.</li><li>Provide only start, pause, resume, sensor, chaos, and readable raw state controls.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test debug_page_loads</li><li>Manual: start a race and accept one lap without refreshing</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>SvelteKit</li><li>Design system</li><li>Production race-control polish</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

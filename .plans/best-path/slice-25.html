@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 25 — Manual tournament race list</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 25 — Manual tournament race list</h1>
+<div class="meta"><span class="tag p2">P2</span><span class="tag">Delivery #24</span><span class="tag">Optional administration</span><p>Prove tournament workflow manually before writing a generator.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Store tournament, creation-ordered heats, and lane-to-driver assignments; heat order is immutable once racing starts.</li><li>Create and view heats; link the heat to its race id and derive the current result from that Rennprotokoll.</li><li>Treat a tournament as a flat heat list until a bracket format is requested.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test manual_tournament_flow</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Brackets</li><li>Automatic advancement</li><li>Standings or winner rules</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><ul><li><a href="https://github.com/iantybo/fifteen-thirty-one-go/pull/77">Fifteen Thirty One tournament management</a></li><li><a href="https://github.com/OpenKnight-Foundation/KnightVerse/pull/698">KnightVerse tournament bracket management</a></li><li><a href="https://github.com/OFranjas/taca-da-pinga/pull/35">Taca da Pinga tournament admin</a></li></ul><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

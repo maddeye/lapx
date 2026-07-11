@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 1 — Race configuration shell</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 1 — Race configuration shell</h1>
+<div class="meta"><span class="tag p0">P0</span><span class="tag">Delivery #1</span><span class="tag">Foundation</span><p>Define the smallest valid RaceEngine boundary before adding race behavior.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Create one domain module containing RaceConfig, Command, Event, RaceState, and validation.</li><li>Accept 1–4 lanes; reject invalid durations, targets, lanes, and commands that do not apply to the current phase.</li><li>Expose <code>RaceEngine::handle(command) -&gt; Result&lt;Vec&lt;Event&gt;, DomainError&gt;</code>; do not add persistence or transport yet.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test invalid_start_config invalid_control_commands</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Persistence</li><li>HTTP or UI</li><li>Hardware adapters</li><li>A framework or separate DTO layer</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>
