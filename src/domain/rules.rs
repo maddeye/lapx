@@ -51,7 +51,7 @@ pub(crate) fn command_root(
         Command::PauseRace { at }
             if matches!(
                 state.active().map(|active| &active.control),
-                Some(RaceControl::Live)
+                Some(RaceControl::Live | RaceControl::Restarting { .. })
             ) =>
         {
             Event::RacePaused { at }
@@ -141,7 +141,7 @@ pub(crate) fn apply(
                 || (origin == EventOrigin::Root
                     && matches!(
                         state.active().map(|race| &race.control),
-                        Some(RaceControl::Live)
+                        Some(RaceControl::Live | RaceControl::Restarting { .. })
                     ))) =>
         {
             pause(state, *at)?

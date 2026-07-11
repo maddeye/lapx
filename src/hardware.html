@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LapX hardware</title>
+  <style>
+    body { font: 16px system-ui; max-width: 70rem; margin: auto; padding: 1rem; }
+    pre { white-space: pre-wrap; background: #eee; padding: 1rem; }
+    #error { color: #a00; }
+  </style>
+</head>
+<body>
+  <h1>LapX hardware</h1>
+  <p>Read-only BCM pin, current input levels, captured edges, commanded power, and polarity-derived output pin levels.</p>
+  <p id="error" role="alert"></p>
+  <pre id="snapshot">Loading…</pre>
+  <script>
+    async function load() {
+      const response = await fetch('/api/hardware');
+      const text = await response.text();
+      if (!response.ok) throw new Error(text);
+      document.getElementById('snapshot').textContent = JSON.stringify(JSON.parse(text), null, 2);
+      document.getElementById('error').textContent = '';
+    }
+    const refresh = () => load().catch(error => document.getElementById('error').textContent = error.message);
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>

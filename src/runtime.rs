@@ -1,8 +1,15 @@
+mod dispatcher;
+
 pub use crate::store::StateSnapshot;
 use crate::{
-    domain::{Command, ProtocolMillis},
-    store::{SqliteStore, StoreError},
+    domain::{Command, ProtocolMillis, RaceControl, RaceStatus},
+    hardware::{
+        CapturedAt, EdgeSink, HardwareConfig, HardwareError, HardwareMonitor, HardwareSnapshot,
+        PowerOutput, RawEdge, TimingSource,
+    },
+    store::{ImmediateError, SqliteStore, StoreError},
 };
+use dispatcher::{Dispatcher, DispatcherHardware, needs_pause};
 use std::{
     fmt,
     sync::{
@@ -12,23 +19,52 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Notify, broadcast},
+    sync::{broadcast, mpsc, oneshot},
     task::JoinError,
     time::Instant,
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+// Allows kernel callback threads to enqueue edges captured just before a due timestamp.
+const CAPTURE_SETTLE_WINDOW: Duration = Duration::from_millis(5);
+
+type CommandResult = Result<StateSnapshot, RuntimeError>;
 
 #[derive(Debug)]
 pub enum RuntimeError {
     Store(StoreError),
     Task(JoinError),
+    Hardware(HardwareError),
+    HardwareLaneMismatch {
+        configured: u8,
+        requested: u8,
+    },
+    PowerAfterCommit {
+        snapshot: Box<StateSnapshot>,
+        source: HardwareError,
+    },
+    DispatcherStopped,
     ClockOverflow,
+    MonotonicClock(std::io::Error),
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::HardwareLaneMismatch {
+                configured,
+                requested,
+            } => write!(
+                f,
+                "race requests {requested} lanes but hardware configures {configured}"
+            ),
+            Self::PowerAfterCommit { snapshot, source } => write!(
+                f,
+                "race state committed at sequence {}; power synchronization failed: {source}",
+                snapshot.sequence
+            ),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 
@@ -46,127 +82,84 @@ impl From<JoinError> for RuntimeError {
     }
 }
 
+impl From<HardwareError> for RuntimeError {
+    fn from(value: HardwareError) -> Self {
+        Self::Hardware(value)
+    }
+}
+
 struct ProtocolClock {
     protocol_at_anchor: ProtocolMillis,
     instant_anchor: Instant,
+    monotonic_anchor: Option<Duration>,
 }
 
 impl ProtocolClock {
     fn now(&self) -> Result<ProtocolMillis, RuntimeError> {
-        let elapsed = u64::try_from(self.instant_anchor.elapsed().as_millis())
-            .map_err(|_| RuntimeError::ClockOverflow)?;
-        self.protocol_at_anchor
-            .checked_add(elapsed)
-            .ok_or(RuntimeError::ClockOverflow)
+        self.at(CapturedAt::Simulation(Instant::now()))
+    }
+
+    fn at(&self, captured_at: CapturedAt) -> Result<ProtocolMillis, RuntimeError> {
+        let (after_anchor, elapsed) = match captured_at {
+            CapturedAt::Simulation(instant) if instant >= self.instant_anchor => {
+                (true, instant - self.instant_anchor)
+            }
+            CapturedAt::Simulation(instant) => (false, self.instant_anchor - instant),
+            CapturedAt::KernelMonotonic(timestamp) => {
+                let anchor = self.monotonic_anchor.ok_or_else(|| {
+                    HardwareError::new("kernel monotonic clock was not calibrated")
+                })?;
+                if timestamp >= anchor {
+                    (true, timestamp - anchor)
+                } else {
+                    (false, anchor - timestamp)
+                }
+            }
+        };
+        let elapsed = duration_millis(elapsed)?;
+        if after_anchor {
+            self.protocol_at_anchor
+                .checked_add(elapsed)
+                .ok_or(RuntimeError::ClockOverflow)
+        } else {
+            self.protocol_at_anchor
+                .checked_sub(elapsed)
+                .ok_or(RuntimeError::ClockOverflow)
+        }
     }
 
     fn observe(&mut self, at: ProtocolMillis) {
         if self.now().is_ok_and(|now| at > now) {
             self.protocol_at_anchor = at;
             self.instant_anchor = Instant::now();
+            self.monotonic_anchor = kernel_monotonic_now().ok().flatten();
         }
     }
 }
 
-pub struct RaceRuntime {
-    store: SqliteStore,
-    race_id: String,
-    apply_boundary: Mutex<()>,
+fn duration_millis(duration: Duration) -> Result<u64, RuntimeError> {
+    u64::try_from(duration.as_millis()).map_err(|_| RuntimeError::ClockOverflow)
+}
+
+struct Shared {
     updates: broadcast::Sender<StateSnapshot>,
-    due_changed: Arc<Notify>,
     published_sequence: AtomicU64,
     clock: StdMutex<ProtocolClock>,
 }
 
-impl RaceRuntime {
-    pub async fn new(
-        store: SqliteStore,
-        race_id: impl Into<String>,
-    ) -> Result<Arc<Self>, RuntimeError> {
-        let race_id = race_id.into();
-        let initial_store = store.clone();
-        let initial_race_id = race_id.clone();
-        let initial =
-            tokio::task::spawn_blocking(move || initial_store.load(&initial_race_id)).await??;
-        let protocol_anchor = initial.state.last_event_at.unwrap_or(0);
-        let (updates, _) = broadcast::channel(16);
-        let runtime = Arc::new(Self {
-            store,
-            race_id,
-            apply_boundary: Mutex::new(()),
-            updates,
-            due_changed: Arc::new(Notify::new()),
-            published_sequence: AtomicU64::new(initial.sequence),
-            clock: StdMutex::new(ProtocolClock {
-                protocol_at_anchor: protocol_anchor,
-                instant_anchor: Instant::now(),
-            }),
-        });
-        Self::spawn_due_task(&runtime);
-        Ok(runtime)
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<StateSnapshot> {
-        self.updates.subscribe()
-    }
-
-    pub async fn snapshot(&self) -> Result<StateSnapshot, RuntimeError> {
-        let _guard = self.apply_boundary.lock().await;
-        self.load().await
-    }
-
-    pub async fn apply(&self, command: Command) -> Result<StateSnapshot, RuntimeError> {
-        let _guard = self.apply_boundary.lock().await;
-        self.execute(command).await
-    }
-
-    pub async fn apply_now<F>(&self, command: F) -> Result<StateSnapshot, RuntimeError>
-    where
-        F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
-    {
-        let _guard = self.apply_boundary.lock().await;
-        self.execute_now(self.protocol_now()?, command).await
-    }
-
-    pub fn protocol_now(&self) -> Result<ProtocolMillis, RuntimeError> {
+impl Shared {
+    fn protocol_now(&self) -> Result<ProtocolMillis, RuntimeError> {
         self.clock
             .lock()
             .map_err(|_| RuntimeError::ClockOverflow)?
             .now()
     }
 
-    async fn execute(&self, command: Command) -> Result<StateSnapshot, RuntimeError> {
-        let store = self.store.clone();
-        let race_id = self.race_id.clone();
-        let snapshot =
-            tokio::task::spawn_blocking(move || store.execute(&race_id, command)).await??;
-        self.publish(&snapshot);
-        self.due_changed.notify_one();
-        Ok(snapshot)
-    }
-
-    async fn execute_now<F>(
-        &self,
-        proposed_at: ProtocolMillis,
-        command: F,
-    ) -> Result<StateSnapshot, RuntimeError>
-    where
-        F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
-    {
-        let store = self.store.clone();
-        let race_id = self.race_id.clone();
-        let snapshot =
-            tokio::task::spawn_blocking(move || store.execute_now(&race_id, proposed_at, command))
-                .await??;
-        self.publish(&snapshot);
-        self.due_changed.notify_one();
-        Ok(snapshot)
-    }
-
-    async fn load(&self) -> Result<StateSnapshot, RuntimeError> {
-        let store = self.store.clone();
-        let race_id = self.race_id.clone();
-        Ok(tokio::task::spawn_blocking(move || store.load(&race_id)).await??)
+    fn protocol_at(&self, captured_at: CapturedAt) -> Result<ProtocolMillis, RuntimeError> {
+        self.clock
+            .lock()
+            .map_err(|_| RuntimeError::ClockOverflow)?
+            .at(captured_at)
     }
 
     fn publish(&self, snapshot: &StateSnapshot) {
@@ -185,53 +178,266 @@ impl RaceRuntime {
             let _ = self.updates.send(snapshot.clone());
         }
     }
+}
 
-    fn spawn_due_task(runtime: &Arc<Self>) {
-        let runtime = Arc::downgrade(runtime);
-        tokio::spawn(async move {
-            loop {
-                let Some(current) = runtime.upgrade() else {
-                    break;
-                };
-                let notify = current.due_changed.clone();
-                let wait = match current.refresh_and_wait().await {
-                    Ok(Some(Duration::ZERO)) => {
-                        if let Err(error) =
-                            current.apply_now(|to| Command::AdvanceRace { to }).await
-                        {
-                            eprintln!("race due apply failed: {error}");
-                            Some(REFRESH_INTERVAL)
-                        } else {
-                            None
-                        }
-                    }
-                    Ok(wait) => Some(wait.unwrap_or(REFRESH_INTERVAL).min(REFRESH_INTERVAL)),
-                    Err(error) => {
-                        eprintln!("race state refresh failed: {error}");
-                        Some(REFRESH_INTERVAL)
-                    }
-                };
-                drop(current);
+struct HardwareRuntime {
+    monitor: HardwareMonitor,
+    _timing: StdMutex<Box<dyn TimingSource>>,
+}
 
-                if let Some(wait) = wait {
-                    tokio::select! {
-                        () = tokio::time::sleep(wait) => {}
-                        () = notify.notified() => {}
-                    }
-                }
-            }
+pub struct RaceRuntime {
+    ingress: mpsc::UnboundedSender<Ingress>,
+    shared: Arc<Shared>,
+    hardware: Option<HardwareRuntime>,
+}
+
+enum CommandRequest {
+    Exact(Command),
+    Now(Command),
+}
+
+struct TimedEdge {
+    lane: u8,
+    edge: crate::domain::SignalEdge,
+    at: ProtocolMillis,
+}
+
+enum Ingress {
+    Command {
+        request: CommandRequest,
+        response: oneshot::Sender<CommandResult>,
+    },
+    Edge(TimedEdge),
+    Snapshot {
+        response: oneshot::Sender<CommandResult>,
+    },
+}
+
+impl RaceRuntime {
+    pub async fn new(
+        store: SqliteStore,
+        race_id: impl Into<String>,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        let race_id = race_id.into();
+        let initial = load_snapshot(&store, &race_id).await?;
+        let (ingress, receiver) = mpsc::unbounded_channel();
+        let shared = shared(&initial, false)?;
+        let runtime = Arc::new(Self {
+            ingress,
+            shared: shared.clone(),
+            hardware: None,
         });
+        Dispatcher::spawn(store, race_id, initial, receiver, shared, None);
+        Ok(runtime)
     }
 
-    async fn refresh_and_wait(&self) -> Result<Option<Duration>, RuntimeError> {
-        let _guard = self.apply_boundary.lock().await;
-        let snapshot = self.load().await?;
-        self.publish(&snapshot);
-        let Some(due_at) = snapshot.state.next_due_at().map_err(StoreError::Domain)? else {
-            return Ok(None);
-        };
-        Ok(Some(Duration::from_millis(
-            due_at.saturating_sub(self.protocol_now()?),
-        )))
+    pub async fn with_hardware<T, P>(
+        store: SqliteStore,
+        race_id: impl Into<String>,
+        config: HardwareConfig,
+        mut timing: T,
+        mut power: P,
+    ) -> Result<Arc<Self>, RuntimeError>
+    where
+        T: TimingSource + 'static,
+        P: PowerOutput + 'static,
+    {
+        let race_id = race_id.into();
+        power.set_lane_power([false; 4])?;
+        let mut initial = load_snapshot(&store, &race_id).await?;
+        validate_hardware_snapshot(&initial, &config)?;
+        if needs_pause(&initial) {
+            initial = execute_now(
+                &store,
+                &race_id,
+                initial.state.last_event_at.unwrap_or(0),
+                |at| Command::PauseRace { at },
+            )
+            .await?;
+        }
+
+        let monitor = HardwareMonitor::new(config.clone());
+        monitor.record_outputs([false; 4]);
+        let (ingress, receiver) = mpsc::unbounded_channel();
+        let shared = shared(&initial, true)?;
+        let edge_ingress = ingress.clone();
+        let edge_shared = shared.clone();
+        let edge_monitor = monitor.clone();
+        timing.start(EdgeSink::new(
+            move |RawEdge {
+                      lane,
+                      edge,
+                      captured_at,
+                  }| {
+                let at = edge_shared.protocol_at(captured_at).map_err(|error| {
+                    let error =
+                        HardwareError::new(format!("edge timestamp conversion failed: {error}"));
+                    edge_monitor.record_error(error.to_string());
+                    error
+                })?;
+                edge_ingress
+                    .send(Ingress::Edge(TimedEdge { lane, edge, at }))
+                    .map_err(|_| HardwareError::new("timing consumer stopped"))
+            },
+        ))?;
+        monitor.record_initial_levels(&timing.initial_levels());
+
+        let runtime = Arc::new(Self {
+            ingress,
+            shared: shared.clone(),
+            hardware: Some(HardwareRuntime {
+                monitor: monitor.clone(),
+                _timing: StdMutex::new(Box::new(timing)),
+            }),
+        });
+        Dispatcher::spawn(
+            store,
+            race_id,
+            initial,
+            receiver,
+            shared,
+            Some(DispatcherHardware {
+                config,
+                monitor,
+                power: Arc::new(StdMutex::new(Box::new(power))),
+                fault: None,
+            }),
+        );
+        Ok(runtime)
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<StateSnapshot> {
+        self.shared.updates.subscribe()
+    }
+
+    pub async fn snapshot(&self) -> Result<StateSnapshot, RuntimeError> {
+        let (response, receive) = oneshot::channel();
+        self.ingress
+            .send(Ingress::Snapshot { response })
+            .map_err(|_| RuntimeError::DispatcherStopped)?;
+        receive.await.map_err(|_| RuntimeError::DispatcherStopped)?
+    }
+
+    pub fn hardware_snapshot(&self) -> Option<HardwareSnapshot> {
+        Some(self.hardware.as_ref()?.monitor.snapshot())
+    }
+
+    pub async fn apply(&self, command: Command) -> Result<StateSnapshot, RuntimeError> {
+        self.request(CommandRequest::Exact(command)).await
+    }
+
+    pub async fn apply_now<F>(&self, command: F) -> Result<StateSnapshot, RuntimeError>
+    where
+        F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
+    {
+        let proposed_at = self.shared.protocol_now()?;
+        self.request(CommandRequest::Now(command(proposed_at)))
+            .await
+    }
+
+    pub fn protocol_now(&self) -> Result<ProtocolMillis, RuntimeError> {
+        self.shared.protocol_now()
+    }
+
+    async fn request(&self, request: CommandRequest) -> CommandResult {
+        let (response, receive) = oneshot::channel();
+        self.ingress
+            .send(Ingress::Command { request, response })
+            .map_err(|_| RuntimeError::DispatcherStopped)?;
+        receive.await.map_err(|_| RuntimeError::DispatcherStopped)?
+    }
+}
+
+fn shared(initial: &StateSnapshot, hardware: bool) -> Result<Arc<Shared>, RuntimeError> {
+    let (updates, _) = broadcast::channel(16);
+    Ok(Arc::new(Shared {
+        updates,
+        published_sequence: AtomicU64::new(initial.sequence),
+        clock: StdMutex::new(ProtocolClock {
+            protocol_at_anchor: initial.state.last_event_at.unwrap_or(0),
+            instant_anchor: Instant::now(),
+            monotonic_anchor: hardware.then(kernel_monotonic_now).transpose()?.flatten(),
+        }),
+    }))
+}
+
+fn validate_hardware_snapshot(
+    snapshot: &StateSnapshot,
+    hardware: &HardwareConfig,
+) -> Result<(), RuntimeError> {
+    let Some(config) = snapshot.state.config() else {
+        return Ok(());
+    };
+    let configured = hardware.lanes.len() as u8;
+    if config.lanes == configured {
+        Ok(())
+    } else {
+        Err(RuntimeError::HardwareLaneMismatch {
+            configured,
+            requested: config.lanes,
+        })
+    }
+}
+
+fn hardware_lane_error(snapshot: &StateSnapshot, configured: u8) -> Option<HardwareError> {
+    let requested = snapshot.state.config()?.lanes;
+    (requested != configured).then(|| {
+        HardwareError::new(
+            RuntimeError::HardwareLaneMismatch {
+                configured,
+                requested,
+            }
+            .to_string(),
+        )
+    })
+}
+
+#[cfg(feature = "gpio")]
+fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is valid writable storage for one `timespec`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return Err(RuntimeError::MonotonicClock(std::io::Error::last_os_error()));
+    }
+    Ok(Some(Duration::new(
+        timestamp
+            .tv_sec
+            .try_into()
+            .map_err(|_| RuntimeError::ClockOverflow)?,
+        timestamp
+            .tv_nsec
+            .try_into()
+            .map_err(|_| RuntimeError::ClockOverflow)?,
+    )))
+}
+
+#[cfg(not(feature = "gpio"))]
+fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
+    Ok(None)
+}
+
+async fn load_snapshot(store: &SqliteStore, race_id: &str) -> Result<StateSnapshot, RuntimeError> {
+    let store = store.clone();
+    let race_id = race_id.to_owned();
+    Ok(tokio::task::spawn_blocking(move || store.load(&race_id)).await??)
+}
+
+async fn execute_now<F>(
+    store: &SqliteStore,
+    race_id: &str,
+    proposed_at: ProtocolMillis,
+    command: F,
+) -> Result<StateSnapshot, RuntimeError>
+where
+    F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
+{
+    let store = store.clone();
+    let race_id = race_id.to_owned();
+    Ok(
+        tokio::task::spawn_blocking(move || store.execute_now(&race_id, proposed_at, command))
+            .await??,
+    )
 }
