@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 pub struct GpioTimingSource {
     config: HardwareConfig,
-    pins: Vec<InputPin>,
+    pins: Vec<(u8, InputPin)>,
 }
 
 impl GpioTimingSource {
@@ -30,29 +30,30 @@ impl TimingSource for GpioTimingSource {
                 PullMode::Down => pin.into_input_pulldown(),
             };
             let lane = mapping.lane;
-            let bcm_pin = mapping.input.bcm_pin;
-            let active_edge = mapping.input.active_edge;
             let sink = sink.clone();
             pin.set_async_interrupt(Trigger::Both, None, move |event| {
-                let captured_at = Instant::now();
-                let (edge, level) = match event.trigger {
-                    Trigger::RisingEdge => (SignalEdge::Rising, true),
-                    Trigger::FallingEdge => (SignalEdge::Falling, false),
+                let edge = match event.trigger {
+                    Trigger::RisingEdge => SignalEdge::Rising,
+                    Trigger::FallingEdge => SignalEdge::Falling,
                     _ => return,
                 };
                 let _ = sink.accept(RawEdge {
                     lane,
-                    bcm_pin,
                     edge,
-                    captured_at,
-                    level,
-                    active: edge == active_edge,
+                    captured_at: Instant::now(),
                 });
             })
             .map_err(gpio_error)?;
-            self.pins.push(pin);
+            self.pins.push((lane, pin));
         }
         Ok(())
+    }
+
+    fn initial_levels(&self) -> Vec<(u8, bool)> {
+        self.pins
+            .iter()
+            .map(|(lane, pin)| (*lane, pin.is_high()))
+            .collect()
     }
 }
 

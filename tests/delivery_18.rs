@@ -18,7 +18,7 @@ use tower::ServiceExt;
 
 fn config() -> HardwareConfig {
     HardwareConfig::new(vec![LaneHardwareConfig {
-        lane: 2,
+        lane: 1,
         input: InputConfig {
             bcm_pin: 27,
             active_edge: SignalEdge::Falling,
@@ -47,12 +47,9 @@ async fn hardware_page_loads_snapshot_with_lane_pin_mapping_and_polling() {
     .unwrap();
     timing
         .emit(RawEdge {
-            lane: 2,
-            bcm_pin: 27,
+            lane: 1,
             edge: SignalEdge::Rising,
             captured_at: Instant::now(),
-            level: true,
-            active: false,
         })
         .unwrap();
     let app = router(runtime);
@@ -66,9 +63,9 @@ async fn hardware_page_loads_snapshot_with_lane_pin_mapping_and_polling() {
     let snapshot: HardwareSnapshot =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(snapshot.config, config());
-    assert_eq!(snapshot.input_levels[1], Some(true));
-    let edge = snapshot.latest_edges[1].as_ref().unwrap();
-    assert_eq!((edge.lane, edge.bcm_pin), (2, 27));
+    assert_eq!(snapshot.input_levels[0], Some(true));
+    let edge = snapshot.latest_edges[0].as_ref().unwrap();
+    assert_eq!((edge.lane, edge.bcm_pin), (1, 27));
     assert_eq!(edge.edge, SignalEdge::Rising);
     assert!(!edge.active);
     assert!(edge.protocol_at.is_some());

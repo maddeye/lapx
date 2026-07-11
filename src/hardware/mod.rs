@@ -5,7 +5,7 @@ use std::{
     fmt,
     sync::{Arc, Mutex},
 };
-use tokio::{sync::mpsc, time::Instant};
+use tokio::time::Instant;
 
 #[cfg(feature = "gpio")]
 pub mod gpio;
@@ -51,15 +51,17 @@ impl HardwareConfig {
         let mut lane_numbers = HashSet::new();
         let mut pins = HashSet::new();
         for mapping in &lanes {
-            if !(1..=4).contains(&mapping.lane) {
-                return Err(HardwareError::new("hardware lane must be between 1 and 4"));
-            }
             if !lane_numbers.insert(mapping.lane) {
                 return Err(HardwareError::new("hardware lanes must be unique"));
             }
             if !pins.insert(mapping.input.bcm_pin) || !pins.insert(mapping.relay.bcm_pin) {
                 return Err(HardwareError::new("hardware BCM pins must be unique"));
             }
+        }
+        if !(1..=lanes.len() as u8).all(|lane| lane_numbers.contains(&lane)) {
+            return Err(HardwareError::new(
+                "hardware lanes must be contiguous from 1",
+            ));
         }
         Ok(Self { lanes })
     }
@@ -107,6 +109,10 @@ impl HardwareConfig {
             .collect::<Result<Vec<_>, _>>()?;
         Self::new(lanes)
     }
+
+    pub(crate) fn lane(&self, lane: u8) -> Option<&LaneHardwareConfig> {
+        self.lanes.iter().find(|mapping| mapping.lane == lane)
+    }
 }
 
 impl<'de> Deserialize<'de> for HardwareConfig {
@@ -132,11 +138,8 @@ fn parse_number(value: &str, name: &str) -> Result<u8, HardwareError> {
 #[derive(Clone, Debug)]
 pub struct RawEdge {
     pub lane: u8,
-    pub bcm_pin: u8,
     pub edge: SignalEdge,
     pub captured_at: Instant,
-    pub level: bool,
-    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,29 +158,31 @@ pub struct HardwareSnapshot {
     pub input_levels: [Option<bool>; 4],
     pub latest_edges: [Option<EdgeSnapshot>; 4],
     pub commanded_outputs: [bool; 4],
+    pub output_levels: [Option<bool>; 4],
     pub last_error: Option<String>,
 }
 
 #[derive(Clone)]
-pub struct EdgeSink {
-    monitor: HardwareMonitor,
-    sender: mpsc::UnboundedSender<RawEdge>,
-}
+pub struct EdgeSink(Arc<dyn Fn(RawEdge) -> Result<(), HardwareError> + Send + Sync>);
 
 impl EdgeSink {
+    pub(crate) fn new(
+        send: impl Fn(RawEdge) -> Result<(), HardwareError> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(send))
+    }
+
     pub fn accept(&self, edge: RawEdge) -> Result<(), HardwareError> {
-        self.monitor.record_edge(edge.clone());
-        if edge.active {
-            self.sender
-                .send(edge)
-                .map_err(|_| HardwareError::new("timing consumer stopped"))?;
-        }
-        Ok(())
+        (self.0)(edge)
     }
 }
 
 pub trait TimingSource: Send {
     fn start(&mut self, sink: EdgeSink) -> Result<(), HardwareError>;
+
+    fn initial_levels(&self) -> Vec<(u8, bool)> {
+        Vec::new()
+    }
 }
 
 pub trait PowerOutput: Send {
@@ -209,14 +214,28 @@ impl PowerOutput for SimulationPowerOutput {
     }
 }
 
+#[derive(Default)]
+struct SimulationTimingState {
+    sink: Option<EdgeSink>,
+    initial_levels: Vec<(u8, bool)>,
+}
+
 #[derive(Clone, Default)]
-pub struct SimulationTimingSource(Arc<Mutex<Option<EdgeSink>>>);
+pub struct SimulationTimingSource(Arc<Mutex<SimulationTimingState>>);
 
 impl SimulationTimingSource {
+    pub fn with_initial_levels(levels: Vec<(u8, bool)>) -> Self {
+        Self(Arc::new(Mutex::new(SimulationTimingState {
+            sink: None,
+            initial_levels: levels,
+        })))
+    }
+
     pub fn emit(&self, edge: RawEdge) -> Result<(), HardwareError> {
         self.0
             .lock()
             .expect("simulation timing lock poisoned")
+            .sink
             .as_ref()
             .ok_or_else(|| HardwareError::new("simulation timing source is not started"))?
             .accept(edge)
@@ -225,30 +244,31 @@ impl SimulationTimingSource {
 
 impl TimingSource for SimulationTimingSource {
     fn start(&mut self, sink: EdgeSink) -> Result<(), HardwareError> {
-        *self.0.lock().expect("simulation timing lock poisoned") = Some(sink);
+        self.0.lock().expect("simulation timing lock poisoned").sink = Some(sink);
         Ok(())
+    }
+
+    fn initial_levels(&self) -> Vec<(u8, bool)> {
+        self.0
+            .lock()
+            .expect("simulation timing lock poisoned")
+            .initial_levels
+            .clone()
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct HardwareMonitor(Arc<Mutex<MonitorState>>);
-
-struct MonitorState {
-    snapshot: HardwareSnapshot,
-    captured_at: [Option<Instant>; 4],
-}
+pub(crate) struct HardwareMonitor(Arc<Mutex<HardwareSnapshot>>);
 
 impl HardwareMonitor {
     pub(crate) fn new(config: HardwareConfig) -> Self {
-        Self(Arc::new(Mutex::new(MonitorState {
-            snapshot: HardwareSnapshot {
-                config,
-                input_levels: [None; 4],
-                latest_edges: std::array::from_fn(|_| None),
-                commanded_outputs: [false; 4],
-                last_error: None,
-            },
-            captured_at: [None; 4],
+        Self(Arc::new(Mutex::new(HardwareSnapshot {
+            config,
+            input_levels: [None; 4],
+            latest_edges: std::array::from_fn(|_| None),
+            commanded_outputs: [false; 4],
+            output_levels: [None; 4],
+            last_error: None,
         })))
     }
 
@@ -256,82 +276,60 @@ impl HardwareMonitor {
         self.0
             .lock()
             .expect("hardware monitor lock poisoned")
-            .snapshot
             .clone()
     }
 
-    fn record_edge(&self, edge: RawEdge) {
-        let Some(index) = edge.lane.checked_sub(1).map(usize::from).filter(|i| *i < 4) else {
-            self.record_error(format!("timing source reported invalid lane {}", edge.lane));
-            return;
-        };
-        let mut state = self.0.lock().expect("hardware monitor lock poisoned");
-        state.snapshot.input_levels[index] = Some(edge.level);
-        state.captured_at[index] = Some(edge.captured_at);
-        state.snapshot.latest_edges[index] = Some(EdgeSnapshot {
-            lane: edge.lane,
-            bcm_pin: edge.bcm_pin,
-            edge: edge.edge,
-            protocol_at: None,
-            level: edge.level,
-            active: edge.active,
-        });
-    }
-
-    pub(crate) fn record_protocol(&self, edge: &RawEdge, at: ProtocolMillis) {
-        let Some(index) = edge.lane.checked_sub(1).map(usize::from).filter(|i| *i < 4) else {
-            return;
-        };
-        let mut state = self.0.lock().expect("hardware monitor lock poisoned");
-        if state.captured_at[index] == Some(edge.captured_at)
-            && let Some(latest) = &mut state.snapshot.latest_edges[index]
-        {
-            latest.protocol_at = Some(at);
-        }
-    }
-
-    pub(crate) fn map_protocols(&self, mut map: impl FnMut(Instant) -> Option<ProtocolMillis>) {
-        let mut state = self.0.lock().expect("hardware monitor lock poisoned");
-        for index in 0..4 {
-            if state.snapshot.latest_edges[index]
-                .as_ref()
-                .is_some_and(|edge| edge.protocol_at.is_none())
-                && let Some(captured_at) = state.captured_at[index]
-                && let Some(protocol_at) = map(captured_at)
-                && let Some(edge) = &mut state.snapshot.latest_edges[index]
-            {
-                edge.protocol_at = Some(protocol_at);
+    pub(crate) fn record_initial_levels(&self, levels: &[(u8, bool)]) {
+        let mut snapshot = self.0.lock().expect("hardware monitor lock poisoned");
+        for &(lane, level) in levels {
+            if snapshot.config.lane(lane).is_some() {
+                snapshot.input_levels[usize::from(lane - 1)] = Some(level);
+            } else {
+                snapshot.last_error = Some(format!(
+                    "timing source reported initial level for invalid lane {lane}"
+                ));
             }
         }
     }
 
+    pub(crate) fn record_edge(&self, edge: &RawEdge, at: ProtocolMillis) -> bool {
+        let mut snapshot = self.0.lock().expect("hardware monitor lock poisoned");
+        let Some(mapping) = snapshot.config.lane(edge.lane).cloned() else {
+            snapshot.last_error =
+                Some(format!("timing source reported invalid lane {}", edge.lane));
+            return false;
+        };
+        let index = usize::from(edge.lane - 1);
+        let level = edge.edge == SignalEdge::Rising;
+        let active = edge.edge == mapping.input.active_edge;
+        snapshot.input_levels[index] = Some(level);
+        snapshot.latest_edges[index] = Some(EdgeSnapshot {
+            lane: edge.lane,
+            bcm_pin: mapping.input.bcm_pin,
+            edge: edge.edge,
+            protocol_at: Some(at),
+            level,
+            active,
+        });
+        active
+    }
+
     pub(crate) fn record_outputs(&self, outputs: [bool; 4]) {
-        self.0
-            .lock()
-            .expect("hardware monitor lock poisoned")
-            .snapshot
-            .commanded_outputs = outputs;
+        let mut snapshot = self.0.lock().expect("hardware monitor lock poisoned");
+        snapshot.commanded_outputs = outputs;
+        snapshot.output_levels = [None; 4];
+        for mapping in &snapshot.config.lanes.clone() {
+            let index = usize::from(mapping.lane - 1);
+            snapshot.output_levels[index] = Some(outputs[index] == mapping.relay.active_high);
+        }
     }
 
     pub(crate) fn record_error(&self, error: impl Into<String>) {
         self.0
             .lock()
             .expect("hardware monitor lock poisoned")
-            .snapshot
             .last_error = Some(error.into());
     }
-}
-
-pub(crate) fn channel(
-    config: HardwareConfig,
-) -> (HardwareMonitor, EdgeSink, mpsc::UnboundedReceiver<RawEdge>) {
-    let monitor = HardwareMonitor::new(config);
-    let (sender, receiver) = mpsc::unbounded_channel();
-    let sink = EdgeSink {
-        monitor: monitor.clone(),
-        sender,
-    };
-    (monitor, sink, receiver)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

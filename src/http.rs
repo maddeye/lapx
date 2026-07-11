@@ -60,6 +60,10 @@ async fn state(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<StateSnap
 async fn hardware_state(
     State(runtime): State<Arc<RaceRuntime>>,
 ) -> Result<Json<HardwareSnapshot>, HttpError> {
+    if runtime.hardware_snapshot().is_none() {
+        return Err(HttpError::HardwareUnavailable);
+    }
+    runtime.snapshot().await?;
     runtime
         .hardware_snapshot()
         .map(Json)
@@ -204,10 +208,20 @@ impl From<RuntimeError> for HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
+        if let Self::Runtime(RuntimeError::PowerAfterCommit { snapshot, source }) = &self {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": source.to_string(),
+                    "committed": snapshot,
+                })),
+            )
+                .into_response();
+        }
         let status = match &self {
-            Self::Malformed(_) | Self::Runtime(RuntimeError::Store(StoreError::Domain(_))) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::Malformed(_)
+            | Self::Runtime(RuntimeError::Store(StoreError::Domain(_)))
+            | Self::Runtime(RuntimeError::HardwareLaneMismatch { .. }) => StatusCode::BAD_REQUEST,
             Self::HardwareUnavailable => StatusCode::NOT_FOUND,
             Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE

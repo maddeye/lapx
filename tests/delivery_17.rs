@@ -5,13 +5,16 @@ use lapx::{
     },
     hardware::{
         HardwareConfig, HardwareError, InputConfig, LaneHardwareConfig, PowerOutput, PullMode,
-        RelayConfig, SimulationPowerOutput, SimulationTimingSource,
+        RawEdge, RelayConfig, SimulationPowerOutput, SimulationTimingSource,
     },
     runtime::{RaceRuntime, RuntimeError},
     store::SqliteStore,
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tempfile::tempdir;
@@ -163,13 +166,13 @@ async fn relay_power_follows_race_state_penalty_abort_and_finish() {
 #[derive(Clone, Default)]
 struct RecordingPower {
     calls: Arc<Mutex<Vec<[bool; 4]>>>,
-    fail_power_on: bool,
+    fail_power_on: Arc<AtomicBool>,
 }
 
 impl PowerOutput for RecordingPower {
     fn set_lane_power(&mut self, lanes: [bool; 4]) -> Result<(), HardwareError> {
         self.calls.lock().unwrap().push(lanes);
-        if self.fail_power_on && lanes.iter().any(|on| *on) {
+        if self.fail_power_on.load(Ordering::SeqCst) && lanes.iter().any(|on| *on) {
             Err(HardwareError::new("relay write failed"))
         } else {
             Ok(())
@@ -177,14 +180,42 @@ impl PowerOutput for RecordingPower {
     }
 }
 
+#[derive(Default)]
+struct PowerGate {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+#[derive(Clone, Default)]
+struct BlockingPower {
+    levels: Arc<Mutex<[bool; 4]>>,
+    gate: Arc<(Mutex<PowerGate>, Condvar)>,
+}
+
+impl PowerOutput for BlockingPower {
+    fn set_lane_power(&mut self, lanes: [bool; 4]) -> Result<(), HardwareError> {
+        let (lock, changed) = &*self.gate;
+        let mut gate = lock.lock().unwrap();
+        if gate.armed && lanes.iter().any(|level| *level) {
+            gate.armed = false;
+            gate.entered = true;
+            changed.notify_all();
+            while !gate.released {
+                gate = changed.wait(gate).unwrap();
+            }
+        }
+        *self.levels.lock().unwrap() = lanes;
+        Ok(())
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn power_failure_reports_committed_state_broadcasts_and_fails_safe_once() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    let power = RecordingPower {
-        fail_power_on: true,
-        ..Default::default()
-    };
+    let power = RecordingPower::default();
+    power.fail_power_on.store(true, Ordering::SeqCst);
     let calls = power.calls.clone();
     let runtime = RaceRuntime::with_hardware(
         SqliteStore::open(&path).unwrap(),
@@ -207,12 +238,12 @@ async fn power_failure_reports_committed_state_broadcasts_and_fails_safe_once() 
         .apply(Command::AdvanceRace { to: 10 })
         .await
         .unwrap_err();
-    let sequence = match error {
-        RuntimeError::PowerAfterCommit { sequence, .. } => sequence,
+    let committed = match error {
+        RuntimeError::PowerAfterCommit { snapshot, .. } => snapshot,
         other => panic!("unexpected error: {other}"),
     };
     let broadcast = updates.recv().await.unwrap();
-    assert_eq!(broadcast.sequence, sequence);
+    assert_eq!(broadcast, *committed);
     assert!(matches!(
         SqliteStore::open(&path)
             .unwrap()
@@ -220,7 +251,7 @@ async fn power_failure_reports_committed_state_broadcasts_and_fails_safe_once() 
             .unwrap()
             .status,
         RaceStatus::Active(ActiveRace {
-            control: RaceControl::Live,
+            control: RaceControl::Paused { .. },
             ..
         })
     ));
@@ -237,6 +268,139 @@ async fn power_failure_reports_committed_state_broadcasts_and_fails_safe_once() 
         call_count,
         "must not blindly retry"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn power_fault_stays_off_through_refresh_edge_and_due_until_resume() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("latched.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let power = RecordingPower::default();
+    power.fail_power_on.store(true, Ordering::SeqCst);
+    let calls = power.calls.clone();
+    let runtime = RaceRuntime::with_hardware(
+        store,
+        "race",
+        hardware_config(),
+        timing.clone(),
+        power.clone(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    let error = runtime
+        .apply(Command::AdvanceRace { to: 10 })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RuntimeError::PowerAfterCommit { .. }));
+    let failed_calls = calls.lock().unwrap().len();
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    timing
+        .emit(RawEdge {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: tokio::time::Instant::now(),
+        })
+        .unwrap();
+    runtime
+        .apply(Command::AdvanceRace { to: 200 })
+        .await
+        .unwrap();
+    runtime.snapshot().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), failed_calls);
+    assert_eq!(
+        runtime.hardware_snapshot().unwrap().commanded_outputs,
+        [false; 4]
+    );
+
+    power.fail_power_on.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_millis(200)).await;
+    runtime.snapshot().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), failed_calls);
+
+    runtime
+        .apply(Command::ResumeRace { at: 210 })
+        .await
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().last(), Some(&[false; 4]));
+    runtime
+        .apply(Command::AdvanceRace { to: 220 })
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.lock().unwrap().last(),
+        Some(&[true, true, false, false])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_external_pause_is_not_overwritten_by_a_stale_power_projection() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("guarded.db")).unwrap();
+    let power = BlockingPower::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        SimulationTimingSource::default(),
+        power.clone(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    power.gate.0.lock().unwrap().armed = true;
+
+    let advancing = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.apply(Command::AdvanceRace { to: 10 }).await })
+    };
+    tokio::task::spawn_blocking({
+        let gate = power.gate.clone();
+        move || {
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.entered {
+                state = changed.wait(state).unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let pausing = tokio::task::spawn_blocking({
+        let store = store.clone();
+        move || store.execute("race", Command::PauseRace { at: 20 })
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(
+        !pausing.is_finished(),
+        "external writer bypassed the guarded projection"
+    );
+    {
+        let (lock, changed) = &*power.gate;
+        let mut state = lock.lock().unwrap();
+        state.released = true;
+        changed.notify_all();
+    }
+
+    advancing.await.unwrap().unwrap();
+    let paused = pausing.await.unwrap().unwrap();
+    let projected = runtime.snapshot().await.unwrap();
+    assert_eq!(projected, paused);
+    assert_eq!(*power.levels.lock().unwrap(), [false; 4]);
 }
 
 #[tokio::test]

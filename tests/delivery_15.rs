@@ -1,5 +1,5 @@
 use lapx::{
-    domain::{Command, Consequence, FinishCondition, FinishMode, RaceConfig, SignalEdge},
+    domain::{Command, Consequence, Event, FinishCondition, FinishMode, RaceConfig, SignalEdge},
     hardware::{
         HardwareConfig, InputConfig, LaneHardwareConfig, PullMode, RawEdge, RelayConfig,
         SimulationPowerOutput, SimulationTimingSource,
@@ -7,6 +7,7 @@ use lapx::{
     runtime::RaceRuntime,
     store::SqliteStore,
 };
+use rusqlite::Connection;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::Instant;
@@ -77,16 +78,17 @@ async fn simulation_timing_source_triggers_lap() {
         .unwrap();
     runtime.apply(Command::AdvanceRace { to: 1 }).await.unwrap();
     assert_eq!(power.lane_power(), [true, true, false, false]);
+    assert_eq!(
+        runtime.hardware_snapshot().unwrap().output_levels,
+        [Some(true), Some(false), None, None]
+    );
 
     tokio::time::advance(Duration::from_millis(100)).await;
     timing
         .emit(RawEdge {
             lane: 1,
-            bcm_pin: 17,
             edge: SignalEdge::Rising,
             captured_at: Instant::now(),
-            level: true,
-            active: true,
         })
         .unwrap();
 
@@ -98,4 +100,55 @@ async fn simulation_timing_source_triggers_lap() {
         }
     };
     assert_eq!(snapshot.state.lane(1).unwrap().laps, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn captured_edge_precedes_an_elapsed_due_timer_with_its_original_timestamp() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("ordered.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = race_config();
+    config.start_sequence_ms = 100;
+    config.false_start_consequence = Consequence::ResultTimePenaltyMs(1);
+    runtime
+        .apply(Command::StartRace { config, at: 0 })
+        .await
+        .unwrap();
+    let mut updates = runtime.subscribe();
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    let lock = Connection::open(dir.path().join("ordered.db")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    timing
+        .emit(RawEdge {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: Instant::now(),
+        })
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(2)).await;
+    lock.execute_batch("COMMIT").unwrap();
+
+    updates.recv().await.unwrap();
+    updates.recv().await.unwrap();
+    let events = store.events("race").unwrap();
+    let captured = events
+        .iter()
+        .position(|event| matches!(event, Event::MeasurementCaptured { at: 99, .. }))
+        .expect("edge kept its capture timestamp");
+    let due = events
+        .iter()
+        .position(|event| matches!(event, Event::OfficialStart { at: 100 }))
+        .expect("due event materialized");
+    assert!(captured < due);
 }

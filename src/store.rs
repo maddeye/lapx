@@ -30,6 +30,21 @@ pub struct SqliteStore {
 }
 
 #[derive(Debug)]
+pub enum ImmediateError<E> {
+    Store(StoreError),
+    Callback {
+        snapshot: Box<StateSnapshot>,
+        source: E,
+    },
+}
+
+impl<E> From<StoreError> for ImmediateError<E> {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+#[derive(Debug)]
 pub enum StoreError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
@@ -139,11 +154,27 @@ impl SqliteStore {
 
     pub fn load(&self, race_id: &str) -> Result<StateSnapshot, StoreError> {
         let connection = self.connect()?;
-        let events = load_events(&connection, race_id)?;
-        Ok(StateSnapshot {
-            sequence: events.len() as u64,
-            state: replay(&events)?.state().clone(),
-        })
+        snapshot(&connection, race_id)
+    }
+
+    pub fn with_immediate_head<T, E>(
+        &self,
+        race_id: &str,
+        callback: impl FnOnce(&StateSnapshot) -> Result<T, E>,
+    ) -> Result<(StateSnapshot, T), ImmediateError<E>> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
+        let snapshot = snapshot(&transaction, race_id)?;
+        let result = callback(&snapshot);
+        transaction.commit().map_err(StoreError::from)?;
+        result
+            .map(|value| (snapshot.clone(), value))
+            .map_err(|source| ImmediateError::Callback {
+                snapshot: Box::new(snapshot),
+                source,
+            })
     }
 
     pub fn events(&self, race_id: &str) -> Result<Vec<Event>, StoreError> {
@@ -162,6 +193,14 @@ impl SqliteStore {
 fn replay(events: &[Event]) -> Result<RaceEngine, StoreError> {
     RaceEngine::replay(events)
         .map_err(|error| StoreError::CorruptProtocol(format!("invalid event history: {error:?}")))
+}
+
+fn snapshot(connection: &Connection, race_id: &str) -> Result<StateSnapshot, StoreError> {
+    let events = load_events(connection, race_id)?;
+    Ok(StateSnapshot {
+        sequence: events.len() as u64,
+        state: replay(&events)?.state().clone(),
+    })
 }
 
 fn load_events(connection: &Connection, race_id: &str) -> Result<Vec<Event>, StoreError> {
