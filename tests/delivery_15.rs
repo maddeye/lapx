@@ -168,9 +168,8 @@ async fn captured_edge_precedes_an_elapsed_due_timer_with_its_original_timestamp
         .apply(Command::StartRace { config, at: 0 })
         .await
         .unwrap();
-    let mut updates = runtime.subscribe();
-
-    tokio::time::advance(Duration::from_millis(99)).await;
+    let now = runtime.protocol_now().unwrap();
+    tokio::time::advance(Duration::from_millis(99 - now)).await;
     let lock = Connection::open(dir.path().join("ordered.db")).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     timing
@@ -184,8 +183,10 @@ async fn captured_edge_precedes_an_elapsed_due_timer_with_its_original_timestamp
     tokio::time::advance(Duration::from_millis(2)).await;
     lock.execute_batch("COMMIT").unwrap();
 
-    updates.recv().await.unwrap();
-    updates.recv().await.unwrap();
+    runtime.snapshot().await.unwrap();
+    tokio::task::yield_now().await;
+    runtime.snapshot().await.unwrap();
+    runtime.snapshot().await.unwrap();
     let events = store.events("race").unwrap();
     let captured = events
         .iter()
@@ -199,7 +200,7 @@ async fn captured_edge_precedes_an_elapsed_due_timer_with_its_original_timestamp
 }
 
 #[tokio::test(start_paused = true)]
-async fn hardware_edges_are_capture_ordered_and_settled_before_due() {
+async fn older_edge_arriving_during_settle_commits_first() {
     let dir = tempdir().unwrap();
     let store = SqliteStore::open(dir.path().join("capture-order.db")).unwrap();
     let timing = SimulationTimingSource::default();
@@ -220,65 +221,305 @@ async fn hardware_edges_are_capture_ordered_and_settled_before_due() {
         .await
         .unwrap();
 
-    tokio::time::advance(Duration::from_millis(97)).await;
-    let first = CapturedAt::Simulation(Instant::now());
+    let older_at = runtime.protocol_now().unwrap();
+    let older = CapturedAt::Simulation(Instant::now());
     tokio::time::advance(Duration::from_millis(1)).await;
-    let second = CapturedAt::Simulation(Instant::now());
+    let newer_at = runtime.protocol_now().unwrap();
+    let newer = CapturedAt::Simulation(Instant::now());
     timing
         .emit(RawEdge {
             lane: 2,
             edge: SignalEdge::Falling,
-            captured_at: second,
+            captured_at: newer,
+        })
+        .unwrap();
+    tokio::task::yield_now().await;
+    timing
+        .emit(RawEdge {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: older,
+        })
+        .unwrap();
+    runtime.snapshot().await.unwrap();
+
+    let measurements: Vec<_> = store
+        .events("race")
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::MeasurementCaptured { lane, at, .. } => Some((lane, at)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(measurements, vec![(1, older_at), (2, newer_at)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_does_not_split_capture_ordering() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("snapshot-order.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = race_config();
+    config.start_sequence_ms = 100;
+    config.false_start_consequence = Consequence::ResultTimePenaltyMs(1);
+    runtime
+        .apply(Command::StartRace { config, at: 0 })
+        .await
+        .unwrap();
+
+    let older_at = runtime.protocol_now().unwrap();
+    let older = CapturedAt::Simulation(Instant::now());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let newer_at = runtime.protocol_now().unwrap();
+    timing
+        .emit(RawEdge {
+            lane: 2,
+            edge: SignalEdge::Falling,
+            captured_at: CapturedAt::Simulation(Instant::now()),
+        })
+        .unwrap();
+    let snapshot = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.snapshot().await }
+    });
+    tokio::task::yield_now().await;
+    timing
+        .emit(RawEdge {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: older,
+        })
+        .unwrap();
+    snapshot.await.unwrap().unwrap();
+
+    let measurements: Vec<_> = store
+        .events("race")
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::MeasurementCaptured { lane, at, .. } => Some((lane, at)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(measurements, vec![(1, older_at), (2, newer_at)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_first_still_waits_for_captured_edges() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("snapshot-first.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = race_config();
+    config.start_sequence_ms = 100;
+    config.false_start_consequence = Consequence::ResultTimePenaltyMs(1);
+    runtime
+        .apply(Command::StartRace { config, at: 0 })
+        .await
+        .unwrap();
+
+    let at = runtime.protocol_now().unwrap();
+    let snapshot = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.snapshot().await }
+    });
+    tokio::task::yield_now().await;
+    timing
+        .emit(RawEdge {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: CapturedAt::Simulation(Instant::now()),
+        })
+        .unwrap();
+    let snapshot = snapshot.await.unwrap().unwrap();
+
+    assert!(snapshot.sequence > 2);
+    assert!(store.events("race").unwrap().iter().any(
+        |event| matches!(event, Event::MeasurementCaptured { lane: 1, at: event_at, .. } if *event_at == at)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn now_pause_is_ordered_between_edges_in_the_same_settle_batch() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("command-order.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: race_config(),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    runtime.apply(Command::AdvanceRace { to: 1 }).await.unwrap();
+
+    let older_at = runtime.protocol_now().unwrap();
+    let older = CapturedAt::Simulation(Instant::now());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let pause_at = runtime.protocol_now().unwrap();
+    let pause = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.apply_now(|at| Command::PauseRace { at }).await }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let newer_at = runtime.protocol_now().unwrap();
+    timing
+        .emit(RawEdge {
+            lane: 2,
+            edge: SignalEdge::Falling,
+            captured_at: CapturedAt::Simulation(Instant::now()),
         })
         .unwrap();
     timing
         .emit(RawEdge {
             lane: 1,
             edge: SignalEdge::Rising,
-            captured_at: first,
+            captured_at: older,
         })
         .unwrap();
+    pause.await.unwrap().unwrap();
     runtime.snapshot().await.unwrap();
 
-    tokio::time::advance(Duration::from_millis(1)).await;
-    let delayed = CapturedAt::Simulation(Instant::now());
+    let events = store.events("race").unwrap();
+    let older = events
+        .iter()
+        .position(|event| matches!(event, Event::MeasurementCaptured { lane: 1, at, .. } if *at == older_at))
+        .unwrap();
+    let pause = events
+        .iter()
+        .position(|event| matches!(event, Event::RacePaused { at } if *at == pause_at))
+        .unwrap();
+    let newer = events
+        .iter()
+        .position(|event| matches!(event, Event::MeasurementCaptured { lane: 2, at, .. } if *at == newer_at))
+        .unwrap();
+    assert!(older < pause && pause < newer);
+}
+
+#[tokio::test(start_paused = true)]
+async fn edge_captured_just_before_due_is_drained_during_timer_settle() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("timer-settle.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = race_config();
+    config.start_sequence_ms = 100;
+    config.false_start_consequence = Consequence::ResultTimePenaltyMs(1);
+    runtime
+        .apply(Command::StartRace { config, at: 0 })
+        .await
+        .unwrap();
+
+    let now = runtime.protocol_now().unwrap();
+    tokio::time::advance(Duration::from_millis(99 - now)).await;
+    let captured = CapturedAt::Simulation(Instant::now());
     tokio::time::advance(Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
     timing
         .emit(RawEdge {
-            lane: 2,
-            edge: SignalEdge::Falling,
-            captured_at: delayed,
+            lane: 1,
+            edge: SignalEdge::Rising,
+            captured_at: captured,
         })
         .unwrap();
-    tokio::time::advance(Duration::from_millis(5)).await;
+    runtime.snapshot().await.unwrap();
     runtime.snapshot().await.unwrap();
 
     let events = store.events("race").unwrap();
-    let measurements: Vec<_> = events
+    let captured = events
         .iter()
-        .filter_map(|event| match event {
-            Event::MeasurementCaptured { lane, at, .. } => Some((*lane, *at)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(measurements, vec![(1, 97), (2, 98), (2, 99)]);
-    let delayed = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                Event::MeasurementCaptured {
-                    lane: 2,
-                    at: 99,
-                    ..
-                }
-            )
-        })
+        .position(|event| matches!(event, Event::MeasurementCaptured { at: 99, .. }))
         .unwrap();
     let due = events
         .iter()
         .position(|event| matches!(event, Event::OfficialStart { at: 100 }))
         .unwrap();
-    assert!(delayed < due);
+    assert!(captured < due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn normalized_edge_timestamp_survives_external_clock_reanchor() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("single-conversion.db")).unwrap();
+    let timing = SimulationTimingSource::default();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        hardware_config(),
+        timing.clone(),
+        SimulationPowerOutput::default(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: race_config(),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    runtime.apply(Command::AdvanceRace { to: 1 }).await.unwrap();
+
+    let expected = runtime.protocol_now().unwrap();
+    let captured_at = CapturedAt::Simulation(Instant::now());
+    store
+        .execute("race", Command::PauseRace { at: 10_000 })
+        .unwrap();
+    let (_, emitted) = tokio::join!(
+        biased;
+        runtime.snapshot(),
+        async {
+            timing.emit(RawEdge {
+                lane: 1,
+                edge: SignalEdge::Falling,
+                captured_at,
+            })
+        }
+    );
+    emitted.unwrap();
+    runtime.snapshot().await.unwrap();
+
+    assert_eq!(
+        runtime.hardware_snapshot().unwrap().latest_edges[0]
+            .as_ref()
+            .unwrap()
+            .protocol_at,
+        Some(expected)
+    );
 }

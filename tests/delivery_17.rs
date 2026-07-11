@@ -210,6 +210,117 @@ impl PowerOutput for BlockingPower {
     }
 }
 
+#[derive(Clone)]
+struct PanicOncePower {
+    levels: Arc<Mutex<[bool; 4]>>,
+    panic_on_power: Arc<AtomicBool>,
+}
+
+impl PowerOutput for PanicOncePower {
+    fn set_lane_power(&mut self, lanes: [bool; 4]) -> Result<(), HardwareError> {
+        if lanes.iter().any(|level| *level) && self.panic_on_power.swap(false, Ordering::SeqCst) {
+            panic!("simulated projection panic");
+        }
+        *self.levels.lock().unwrap() = lanes;
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn projection_panic_recovers_poisoned_power_lock_and_forces_all_off() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("panic-power.db");
+    let levels = Arc::new(Mutex::new([false; 4]));
+    let runtime = RaceRuntime::with_hardware(
+        SqliteStore::open(&path).unwrap(),
+        "race",
+        hardware_config(),
+        SimulationTimingSource::default(),
+        PanicOncePower {
+            levels: levels.clone(),
+            panic_on_power: Arc::new(AtomicBool::new(true)),
+        },
+    )
+    .await
+    .unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+            at: 0,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        runtime.apply(Command::AdvanceRace { to: 10 }).await,
+        Err(RuntimeError::PowerAfterCommit { .. })
+    ));
+    assert_eq!(*levels.lock().unwrap(), [false; 4]);
+    assert!(matches!(
+        SqliteStore::open(path)
+            .unwrap()
+            .load("race")
+            .unwrap()
+            .status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn external_refresh_panic_forces_all_off_and_durable_pause() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("external-panic.db");
+    let levels = Arc::new(Mutex::new([false; 4]));
+    let panic_on_power = Arc::new(AtomicBool::new(false));
+    let runtime = RaceRuntime::with_hardware(
+        SqliteStore::open(&path).unwrap(),
+        "race",
+        hardware_config(),
+        SimulationTimingSource::default(),
+        PanicOncePower {
+            levels: levels.clone(),
+            panic_on_power: panic_on_power.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let external = SqliteStore::open(&path).unwrap();
+    external
+        .execute(
+            "race",
+            Command::StartRace {
+                config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+                at: 0,
+            },
+        )
+        .unwrap();
+    external
+        .execute("race", Command::AdvanceRace { to: 10 })
+        .unwrap();
+    panic_on_power.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        runtime.snapshot().await,
+        Err(RuntimeError::PowerAfterCommit { .. })
+    ));
+    assert_eq!(*levels.lock().unwrap(), [false; 4]);
+    assert!(matches!(
+        SqliteStore::open(path)
+            .unwrap()
+            .load("race")
+            .unwrap()
+            .status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { .. },
+            ..
+        })
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn power_failure_reports_committed_state_broadcasts_and_fails_safe_once() {
     let dir = tempdir().unwrap();
@@ -539,7 +650,7 @@ async fn external_lane_mismatch_latches_fault_without_powering_on() {
     );
 
     let resume = runtime
-        .apply(Command::ResumeRace { at: 20 })
+        .apply_now(|at| Command::ResumeRace { at })
         .await
         .unwrap_err();
     assert!(matches!(resume, RuntimeError::PowerAfterCommit { .. }));

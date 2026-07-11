@@ -299,21 +299,20 @@ impl HardwareMonitor {
         }
     }
 
-    pub(crate) fn record_edge(&self, edge: &RawEdge, at: ProtocolMillis) -> bool {
+    pub(crate) fn record_edge(&self, lane: u8, edge: SignalEdge, at: ProtocolMillis) -> bool {
         let mut snapshot = self.0.lock().expect("hardware monitor lock poisoned");
-        let Some(mapping) = snapshot.config.lane(edge.lane).cloned() else {
-            snapshot.last_error =
-                Some(format!("timing source reported invalid lane {}", edge.lane));
+        let Some(mapping) = snapshot.config.lane(lane).cloned() else {
+            snapshot.last_error = Some(format!("timing source reported invalid lane {lane}"));
             return false;
         };
-        let index = usize::from(edge.lane - 1);
-        let level = edge.edge == SignalEdge::Rising;
-        let active = edge.edge == mapping.input.active_edge;
+        let index = usize::from(lane - 1);
+        let level = edge == SignalEdge::Rising;
+        let active = edge == mapping.input.active_edge;
         snapshot.input_levels[index] = Some(level);
         snapshot.latest_edges[index] = Some(EdgeSnapshot {
-            lane: edge.lane,
+            lane,
             bcm_pin: mapping.input.bcm_pin,
-            edge: edge.edge,
+            edge,
             protocol_at: Some(at),
             level,
             active,

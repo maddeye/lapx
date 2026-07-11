@@ -12,7 +12,6 @@ pub(super) struct Dispatcher {
     race_id: String,
     head: StateSnapshot,
     receiver: mpsc::UnboundedReceiver<Ingress>,
-    pending: VecDeque<Ingress>,
     shared: Arc<Shared>,
     hardware: Option<DispatcherHardware>,
     refresh_at: Instant,
@@ -34,7 +33,6 @@ impl Dispatcher {
                 race_id,
                 head,
                 receiver,
-                pending: VecDeque::new(),
                 shared,
                 hardware,
                 refresh_at: Instant::now() + REFRESH_INTERVAL,
@@ -46,10 +44,6 @@ impl Dispatcher {
 
     async fn run(mut self) {
         loop {
-            if let Some(ingress) = self.pending.pop_front() {
-                self.handle_ingress(ingress).await;
-                continue;
-            }
             let wake_at = self.wake_at();
             tokio::select! {
                 biased;
@@ -63,6 +57,7 @@ impl Dispatcher {
     }
 
     fn wake_at(&self) -> Instant {
+        let refresh_at = self.refresh_at.max(self.timer_retry_at);
         let due_at = self
             .head
             .state
@@ -76,23 +71,15 @@ impl Dispatcher {
                     .map(|now| Instant::now() + Duration::from_millis(due.saturating_sub(now)))
             })
             .map(|due| due.max(self.timer_retry_at))
-            .unwrap_or(self.refresh_at);
-        due_at.min(self.refresh_at)
+            .unwrap_or(refresh_at);
+        due_at.min(refresh_at)
     }
 
     async fn handle_ingress(&mut self, ingress: Ingress) {
-        match ingress {
-            Ingress::Command { request, response } => {
-                if let Some(due) = self.crossed_due(&request) {
-                    self.settle_edges_through(due).await;
-                }
-                let _ = response.send(self.handle_command(request).await);
-            }
-            Ingress::RawEdge(edge) => self.handle_edge_batch(edge).await,
-            Ingress::Snapshot { response } => {
-                let result = self.refresh_external().await.map(|()| self.head.clone());
-                let _ = response.send(result);
-            }
+        if self.hardware.is_some() {
+            self.settle_batch(Some(ingress)).await;
+        } else {
+            self.process_ingress(ingress).await;
         }
     }
 
@@ -106,12 +93,12 @@ impl Dispatcher {
             }
         };
         let mut due = self.head.state.next_due_at().ok().flatten();
-        if let Some(due_at) = due.filter(|due| self.hardware.is_some() && *due <= now) {
-            self.settle_edges_through(due_at).await;
+        if self.hardware.is_some() && due.is_some_and(|due| due <= now) {
+            self.settle_batch(None).await;
             now = match self.shared.protocol_now() {
                 Ok(now) => now,
                 Err(error) => {
-                    eprintln!("race clock failed after edge settle: {error}");
+                    eprintln!("race clock failed after capture settle: {error}");
                     self.timer_retry_at = Instant::now() + REFRESH_INTERVAL;
                     return;
                 }
@@ -119,7 +106,7 @@ impl Dispatcher {
             due = self.head.state.next_due_at().ok().flatten();
         }
         let result = if due.is_some_and(|due| due <= now) {
-            self.handle_command(CommandRequest::Exact(Command::AdvanceRace { to: now }))
+            self.execute_command(Command::AdvanceRace { to: now }, false)
                 .await
                 .map(|_| ())
         } else {
@@ -134,85 +121,81 @@ impl Dispatcher {
         }
     }
 
-    fn crossed_due(&self, request: &CommandRequest) -> Option<ProtocolMillis> {
-        self.hardware.as_ref()?;
-        let at = match request {
-            CommandRequest::Exact(command) => command.timestamp(),
-            CommandRequest::Now(_) => self.shared.protocol_now().ok()?,
-        };
-        self.head
-            .state
-            .next_due_at()
-            .ok()
-            .flatten()
-            .filter(|due| *due <= at)
-    }
-
-    async fn handle_edge_batch(&mut self, first: RawEdge) {
-        let mut edges = vec![first];
-        let mut remaining = VecDeque::new();
-        while let Some(ingress) = self.pending.pop_front() {
-            match ingress {
-                Ingress::RawEdge(edge) => edges.push(edge),
-                ingress => remaining.push_back(ingress),
-            }
-        }
-        self.pending = remaining;
-        while let Ok(ingress) = self.receiver.try_recv() {
-            match ingress {
-                Ingress::RawEdge(edge) => edges.push(edge),
-                ingress => self.pending.push_back(ingress),
-            }
-        }
-        self.apply_edges(edges).await;
-    }
-
-    async fn settle_edges_through(&mut self, due: ProtocolMillis) {
+    async fn settle_batch(&mut self, first: Option<Ingress>) {
         tokio::time::sleep(CAPTURE_SETTLE_WINDOW).await;
+        let mut batch: Vec<_> = first.into_iter().collect();
         while let Ok(ingress) = self.receiver.try_recv() {
-            self.pending.push_back(ingress);
+            batch.push(ingress);
         }
 
-        let mut edges = Vec::new();
-        let mut remaining = VecDeque::new();
-        while let Some(ingress) = self.pending.pop_front() {
-            match ingress {
-                Ingress::RawEdge(edge) => match self.shared.protocol_at(edge.captured_at) {
-                    Ok(at) if at > due => remaining.push_back(Ingress::RawEdge(edge)),
-                    Ok(_) | Err(_) => edges.push(edge),
-                },
-                ingress => remaining.push_back(ingress),
+        let mut ordered = Vec::new();
+        let mut snapshots = Vec::new();
+        for (arrival, ingress) in batch.into_iter().enumerate() {
+            if matches!(&ingress, Ingress::Snapshot { .. }) {
+                snapshots.push(ingress);
+            } else {
+                ordered.push((arrival, ingress));
             }
         }
-        self.pending = remaining;
-        self.apply_edges(edges).await;
+        self.process_ordered(ordered).await;
+        for snapshot in snapshots {
+            self.process_ingress(snapshot).await;
+        }
     }
 
-    async fn apply_edges(&mut self, mut edges: Vec<RawEdge>) {
-        edges.sort_by_key(|edge| (edge.captured_at, edge.lane));
-        for edge in edges {
-            if let Err(error) = self.handle_edge(edge).await {
-                if let Some(hardware) = &self.hardware {
-                    hardware.monitor.record_error(error.to_string());
+    async fn process_ordered(&mut self, mut items: Vec<(usize, Ingress)>) {
+        items.sort_by_key(|(arrival, ingress)| {
+            let (at, priority) = match ingress {
+                Ingress::Edge(edge) => (edge.at, 0),
+                Ingress::Command { request, .. } => (
+                    match request {
+                        CommandRequest::Exact(command) | CommandRequest::Now(command) => {
+                            command.timestamp()
+                        }
+                    },
+                    1,
+                ),
+                Ingress::Snapshot { .. } => unreachable!("snapshots are batch barriers"),
+            };
+            (at, priority, *arrival)
+        });
+        for (_, ingress) in items {
+            self.process_ingress(ingress).await;
+        }
+    }
+
+    async fn process_ingress(&mut self, ingress: Ingress) {
+        match ingress {
+            Ingress::Command { request, response } => {
+                let _ = response.send(self.handle_command(request).await);
+            }
+            Ingress::Edge(edge) => {
+                if let Err(error) = self.handle_edge(edge).await {
+                    if let Some(hardware) = &self.hardware {
+                        hardware.monitor.record_error(error.to_string());
+                    }
+                    eprintln!("timing edge apply failed: {error}");
                 }
-                eprintln!("timing edge apply failed: {error}");
+            }
+            Ingress::Snapshot { response } => {
+                let result = self.refresh_external().await.map(|()| self.head.clone());
+                let _ = response.send(result);
             }
         }
     }
 
-    async fn handle_edge(&mut self, edge: RawEdge) -> CommandResult {
-        let at = self.shared.protocol_at(edge.captured_at)?;
+    async fn handle_edge(&mut self, edge: TimedEdge) -> CommandResult {
         let Some(hardware) = &self.hardware else {
             return Ok(self.head.clone());
         };
-        if !hardware.monitor.record_edge(&edge, at) {
+        if !hardware.monitor.record_edge(edge.lane, edge.edge, edge.at) {
             return Ok(self.head.clone());
         }
         self.execute_command(
             Command::SensorTriggered {
                 lane: edge.lane,
                 edge: edge.edge,
-                at,
+                at: edge.at,
             },
             false,
         )
@@ -222,10 +205,7 @@ impl Dispatcher {
     async fn handle_command(&mut self, request: CommandRequest) -> CommandResult {
         match request {
             CommandRequest::Exact(command) => self.execute_command(command, false).await,
-            CommandRequest::Now(command) => {
-                let command = command(self.shared.protocol_now()?);
-                self.execute_command(command, true).await
-            }
+            CommandRequest::Now(command) => self.execute_command(command, true).await,
         }
     }
 
@@ -267,12 +247,50 @@ impl Dispatcher {
             self.accept_head(committed.clone());
             return Ok(committed);
         }
-        self.project_head(true, resume).await
+        match self.project_head(true, resume).await {
+            Err(error @ (RuntimeError::Store(_) | RuntimeError::Task(_))) => {
+                self.fail_safe_after_projection_gap(committed, error).await
+            }
+            result => result,
+        }
+    }
+
+    async fn fail_safe_after_projection_gap(
+        &mut self,
+        fallback: StateSnapshot,
+        error: RuntimeError,
+    ) -> CommandResult {
+        let mut source = HardwareError::new(format!(
+            "state committed but current-head power projection failed: {error}"
+        ));
+        let hardware = self.hardware.as_mut().expect("hardware checked above");
+        if let Err(all_off) = write_outputs(&hardware.power, &hardware.monitor, [false; 4]) {
+            source = HardwareError::new(format!("{source}; fail-safe all-off failed: {all_off}"));
+        }
+        hardware.monitor.record_error(source.to_string());
+        hardware.fault = Some(source.clone());
+
+        let current = load_snapshot(&self.store, &self.race_id)
+            .await
+            .unwrap_or(fallback);
+        let (snapshot, pause_error) = self.pause_for_fault(current, source.clone()).await;
+        self.accept_head(snapshot.clone());
+        Err(RuntimeError::PowerAfterCommit {
+            snapshot: Box::new(snapshot),
+            source: pause_error.unwrap_or(source),
+        })
     }
 
     async fn refresh_external(&mut self) -> Result<(), RuntimeError> {
         if self.hardware.is_some() {
-            self.project_head(false, false).await?;
+            match self.project_head(false, false).await {
+                Err(error @ (RuntimeError::Store(_) | RuntimeError::Task(_))) => {
+                    self.fail_safe_after_projection_gap(self.head.clone(), error)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
         } else {
             let snapshot = load_snapshot(&self.store, &self.race_id).await?;
             self.accept_head(snapshot);
@@ -425,25 +443,33 @@ fn write_outputs(
     monitor: &HardwareMonitor,
     desired: [bool; 4],
 ) -> Result<(), HardwareError> {
-    let mut power = power
-        .lock()
-        .map_err(|_| HardwareError::new("power output lock poisoned"))?;
-    match power.set_lane_power(desired) {
-        Ok(()) => {
+    let mut power = match power.lock() {
+        Ok(power) => power,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let result = power.set_lane_power(desired);
+    let fail_safe = result
+        .as_ref()
+        .err()
+        .map(|_| power.set_lane_power([false; 4]));
+    drop(power);
+
+    match (result, fail_safe) {
+        (Ok(()), _) => {
             monitor.record_outputs(desired);
             Ok(())
         }
-        Err(error) => {
-            let message = match power.set_lane_power([false; 4]) {
-                Ok(()) => {
-                    monitor.record_outputs([false; 4]);
-                    error.to_string()
-                }
-                Err(fail_safe) => format!("{error}; fail-safe all-off also failed: {fail_safe}"),
-            };
+        (Err(error), Some(Ok(()))) => {
+            monitor.record_outputs([false; 4]);
+            monitor.record_error(error.to_string());
+            Err(error)
+        }
+        (Err(error), Some(Err(fail_safe))) => {
+            let message = format!("{error}; fail-safe all-off also failed: {fail_safe}");
             monitor.record_error(message.clone());
             Err(HardwareError::new(message))
         }
+        (Err(_), None) => unreachable!("failed writes always attempt fail-safe all-off"),
     }
 }
 

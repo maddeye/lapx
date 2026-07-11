@@ -11,7 +11,6 @@ use crate::{
 };
 use dispatcher::{Dispatcher, DispatcherHardware, needs_pause};
 use std::{
-    collections::VecDeque,
     fmt,
     sync::{
         Arc, Mutex as StdMutex,
@@ -30,7 +29,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const CAPTURE_SETTLE_WINDOW: Duration = Duration::from_millis(5);
 
 type CommandResult = Result<StateSnapshot, RuntimeError>;
-type NowCommand = Box<dyn FnOnce(ProtocolMillis) -> Command + Send>;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -195,7 +193,13 @@ pub struct RaceRuntime {
 
 enum CommandRequest {
     Exact(Command),
-    Now(NowCommand),
+    Now(Command),
+}
+
+struct TimedEdge {
+    lane: u8,
+    edge: crate::domain::SignalEdge,
+    at: ProtocolMillis,
 }
 
 enum Ingress {
@@ -203,7 +207,7 @@ enum Ingress {
         request: CommandRequest,
         response: oneshot::Sender<CommandResult>,
     },
-    RawEdge(RawEdge),
+    Edge(TimedEdge),
     Snapshot {
         response: oneshot::Sender<CommandResult>,
     },
@@ -257,11 +261,25 @@ impl RaceRuntime {
         let (ingress, receiver) = mpsc::unbounded_channel();
         let shared = shared(&initial, true)?;
         let edge_ingress = ingress.clone();
-        timing.start(EdgeSink::new(move |edge| {
-            edge_ingress
-                .send(Ingress::RawEdge(edge))
-                .map_err(|_| HardwareError::new("timing consumer stopped"))
-        }))?;
+        let edge_shared = shared.clone();
+        let edge_monitor = monitor.clone();
+        timing.start(EdgeSink::new(
+            move |RawEdge {
+                      lane,
+                      edge,
+                      captured_at,
+                  }| {
+                let at = edge_shared.protocol_at(captured_at).map_err(|error| {
+                    let error =
+                        HardwareError::new(format!("edge timestamp conversion failed: {error}"));
+                    edge_monitor.record_error(error.to_string());
+                    error
+                })?;
+                edge_ingress
+                    .send(Ingress::Edge(TimedEdge { lane, edge, at }))
+                    .map_err(|_| HardwareError::new("timing consumer stopped"))
+            },
+        ))?;
         monitor.record_initial_levels(&timing.initial_levels());
 
         let runtime = Arc::new(Self {
@@ -312,7 +330,9 @@ impl RaceRuntime {
     where
         F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
     {
-        self.request(CommandRequest::Now(Box::new(command))).await
+        let proposed_at = self.shared.protocol_now()?;
+        self.request(CommandRequest::Now(command(proposed_at)))
+            .await
     }
 
     pub fn protocol_now(&self) -> Result<ProtocolMillis, RuntimeError> {
