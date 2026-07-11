@@ -76,7 +76,7 @@ async fn sensor(
     let input = parse(input)?;
     Ok(Json(
         runtime
-            .apply_now(|at| Command::SensorTriggered {
+            .apply_now(move |at| Command::SensorTriggered {
                 lane: input.lane,
                 at,
                 edge: input.edge,
@@ -104,7 +104,7 @@ async fn chaos(
     let input = parse(input)?;
     Ok(Json(
         runtime
-            .apply_now(|at| Command::TriggerChaos {
+            .apply_now(move |at| Command::TriggerChaos {
                 source: input.source,
                 at,
             })
@@ -119,7 +119,7 @@ async fn correct_laps(
     let input = parse(input)?;
     Ok(Json(
         runtime
-            .apply_now(|at| Command::CorrectLaps {
+            .apply_now(move |at| Command::CorrectLaps {
                 lane: input.lane,
                 delta_thousandths: input.delta_thousandths,
                 at,

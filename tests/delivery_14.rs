@@ -146,7 +146,7 @@ async fn external_store_commit_is_published_and_started_automatically() {
             "race",
             Command::StartRace {
                 config: config(),
-                at: 0,
+                at: 10_000,
             },
         )
     })
@@ -154,17 +154,14 @@ async fn external_store_commit_is_published_and_started_automatically() {
     .unwrap()
     .unwrap();
 
-    tokio::time::advance(Duration::from_millis(99)).await;
-    tokio::task::yield_now().await;
-    assert!(matches!(
-        updates.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-    tokio::time::advance(Duration::from_millis(1)).await;
-    let mut seen_external = false;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let external = updates.recv().await.unwrap();
+    assert_eq!(external.sequence, committed.sequence);
+    assert!(runtime.protocol_now().unwrap() >= 10_000);
+
+    tokio::time::advance(Duration::from_millis(100)).await;
     loop {
         let snapshot = updates.recv().await.unwrap();
-        seen_external |= snapshot.sequence == committed.sequence;
         if matches!(
             snapshot.state.status,
             RaceStatus::Active(lapx::domain::ActiveRace {
@@ -172,11 +169,77 @@ async fn external_store_commit_is_published_and_started_automatically() {
                 ..
             })
         ) {
-            assert!(seen_external);
             assert!(snapshot.sequence > committed.sequence);
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn immediate_command_uses_the_durable_protocol_head() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lapx.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let runtime = RaceRuntime::new(store.clone(), "race").await.unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        store.execute(
+            "race",
+            Command::StartRace {
+                config: config(),
+                at: 10_000,
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let snapshot = runtime
+        .apply_now(|to| Command::AdvanceRace { to })
+        .await
+        .expect("runtime timestamp raced behind an external commit");
+    assert!(snapshot.state.last_event_at.unwrap() >= 10_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_timestamp_reanchors_an_advancing_clock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lapx.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let runtime = RaceRuntime::new(store.clone(), "race").await.unwrap();
+    let mut updates = runtime.subscribe();
+
+    tokio::task::spawn_blocking(move || {
+        store.execute(
+            "race",
+            Command::StartRace {
+                config: config(),
+                at: 10_000,
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let snapshot = updates.recv().await.unwrap();
+            if matches!(
+                snapshot.state.status,
+                RaceStatus::Active(lapx::domain::ActiveRace {
+                    lifecycle: Lifecycle::Running { .. },
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("clock did not advance after external timestamp re-anchor");
+    assert!(runtime.protocol_now().unwrap() > 10_000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -97,11 +97,30 @@ impl SqliteStore {
     }
 
     pub fn execute(&self, race_id: &str, command: Command) -> Result<StateSnapshot, StoreError> {
+        self.execute_with(race_id, |_| command)
+    }
+
+    pub fn execute_now<F>(
+        &self,
+        race_id: &str,
+        proposed_at: u64,
+        command: F,
+    ) -> Result<StateSnapshot, StoreError>
+    where
+        F: FnOnce(u64) -> Command,
+    {
+        self.execute_with(race_id, |last| command(proposed_at.max(last.unwrap_or(0))))
+    }
+
+    fn execute_with<F>(&self, race_id: &str, command: F) -> Result<StateSnapshot, StoreError>
+    where
+        F: FnOnce(Option<u64>) -> Command,
+    {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut events = load_events(&transaction, race_id)?;
         let engine = replay(&events)?;
-        let emitted = engine.handle(command)?;
+        let emitted = engine.handle(command(engine.state().last_event_at))?;
         let first_sequence = events.len() as i64 + 1;
         for (offset, event) in emitted.iter().enumerate() {
             transaction.execute(
