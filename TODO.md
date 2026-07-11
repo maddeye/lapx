@@ -14,29 +14,29 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Foundation
 
-- [ ] **Delivery 1 — [Race configuration shell](.plans/best-path/slice-01.html)**
+- [x] **Delivery 1 — [Race configuration shell](.plans/best-path/slice-01.html)**
   - Define `RaceConfig`, commands, events, state, errors, and validation for 1–4 lanes.
   - Verify: `cargo test invalid_start_config invalid_control_commands`.
 
-- [ ] **Delivery 2 — [Start race and replay projection](.plans/best-path/slice-02.html)**
+- [x] **Delivery 2 — [Start race and replay projection](.plans/best-path/slice-02.html)**
   - Start a race through events and rebuild identical state by replay.
   - Verify: `cargo test replay`.
 
-- [ ] **Delivery 3 — [Official start as a due event](.plans/best-path/slice-03.html)**
+- [x] **Delivery 3 — [Official start as a due event](.plans/best-path/slice-03.html)**
   - Add protocol milliseconds, `AdvanceRace`, ordered due events, and timestamp rejection.
   - Verify: `cargo test start_sequence replay_at commands_before_last`.
 
-- [ ] **Delivery 4 — [Messereignis to gültige Runde](.plans/best-path/slice-04.html)**
+- [x] **Delivery 4 — [Messereignis to gültige Runde](.plans/best-path/slice-04.html)**
   - Record measurements and enforce `Mindestrundenzeit` from official start and the previous accepted lap.
   - Verify: `cargo test mindestrundenzeit`.
 
 ## First complete and durable race
 
-- [ ] **Delivery 5 — [Zielbedingung, Zielmodus, and Rundenkorrektur](.plans/best-path/slice-08.html)**
+- [x] **Delivery 5 — [Zielbedingung, Zielmodus, and Rundenkorrektur](.plans/best-path/slice-08.html)**
   - Finish lap- and time-limited races, apply all finish modes, and support event-based corrections.
   - Verify: `cargo test finish live_correction sensor_after_due_time`.
 
-- [ ] **Delivery 6 — [SQLite Rennprotokoll and lapxctl](.plans/best-path/slice-09.html)**
+- [x] **Delivery 6 — [SQLite Rennprotokoll and lapxctl](.plans/best-path/slice-09.html)**
   - Add versioned append-only events, `BEGIN IMMEDIATE`, durable replay, and scriptable JSON CLI commands.
   - Verify: `cargo test store_cli sqlite_store_replays_committed_events` plus concurrent-writer coverage.
 
