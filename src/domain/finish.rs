@@ -1,6 +1,6 @@
 use super::{
-    DomainError, Event, FinishCondition, FinishMode, FinishedRace, Lifecycle, RaceState,
-    RaceStatus, condition_leader,
+    DomainError, Event, FinishCondition, FinishMode, FinishedRace, Lifecycle, ProtocolMillis,
+    RaceState, RaceStatus,
 };
 use std::collections::VecDeque;
 
@@ -9,6 +9,21 @@ enum FinishAction {
     Wait,
     FinishLane(u8),
     FinishAll,
+}
+
+pub(crate) fn condition_leader(state: &RaceState) -> u8 {
+    state
+        .lanes
+        .iter()
+        .min_by_key(|lane| {
+            (
+                std::cmp::Reverse(lane.laps),
+                lane.last_valid_at.unwrap_or(ProtocolMillis::MAX),
+                lane.lane,
+            )
+        })
+        .expect("an active race has lanes")
+        .lane
 }
 
 fn condition_reached(

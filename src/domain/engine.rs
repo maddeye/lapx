@@ -103,32 +103,21 @@ impl RaceEngine {
             return Err(DomainError::InvalidEventOrder);
         }
 
-        let expected = if let Some(next) = self.expected.pop_front() {
+        let origin = if let Some(next) = self.expected.pop_front() {
             if next != *event {
                 return Err(DomainError::InvalidEventOrder);
             }
-            true
-        } else {
-            false
-        };
-        let scheduled = if expected {
-            false
+            rules::EventOrigin::Expected
         } else if let Some(due) = scheduler::earliest(&self.state, event.timestamp())? {
             if due.event(&self.state) != *event {
                 return Err(DomainError::InvalidEventOrder);
             }
-            true
+            rules::EventOrigin::Scheduled
         } else {
-            false
+            rules::EventOrigin::Root
         };
 
-        rules::apply(
-            &mut self.state,
-            event,
-            expected,
-            scheduled,
-            &mut self.expected,
-        )?;
+        rules::apply(&mut self.state, event, origin, &mut self.expected)?;
         self.state.last_event_at = Some(event.timestamp());
         Ok(())
     }

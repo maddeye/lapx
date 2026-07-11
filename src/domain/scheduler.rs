@@ -1,46 +1,34 @@
 use super::{
     DomainError, Event, FinishCondition, Lifecycle, ProtocolMillis, RaceControl, RaceState,
-    RaceStatus,
+    RaceStatus, finish,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DueKind {
-    LanePowerExpiry,
-    OfficialStart,
-    RaceResume,
-    TimeFinish,
-}
-
-impl DueKind {
-    fn priority(self) -> u8 {
-        match self {
-            Self::LanePowerExpiry => 0,
-            Self::OfficialStart => 1,
-            Self::RaceResume => 2,
-            Self::TimeFinish => 3,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Due {
-    pub at: ProtocolMillis,
-    pub kind: DueKind,
-    pub lane: Option<u8>,
+pub(crate) enum Due {
+    LanePowerExpiry { lane: u8, at: ProtocolMillis },
+    OfficialStart { at: ProtocolMillis },
+    RaceResume { at: ProtocolMillis },
+    TimeFinish { at: ProtocolMillis },
 }
 
 impl Due {
+    fn key(self) -> (ProtocolMillis, u8, Option<u8>) {
+        match self {
+            Self::LanePowerExpiry { lane, at } => (at, 0, Some(lane)),
+            Self::OfficialStart { at } => (at, 1, None),
+            Self::RaceResume { at } => (at, 2, None),
+            Self::TimeFinish { at } => (at, 3, None),
+        }
+    }
+
     pub fn event(self, state: &RaceState) -> Event {
-        match self.kind {
-            DueKind::LanePowerExpiry => Event::LanePowerOffExpired {
-                lane: self.lane.expect("lane expiry always has a lane"),
-                at: self.at,
-            },
-            DueKind::OfficialStart => Event::OfficialStart { at: self.at },
-            DueKind::RaceResume => Event::RaceResumed { at: self.at },
-            DueKind::TimeFinish => Event::FinishConditionReached {
-                at: self.at,
-                leader_lane: condition_leader(state),
+        match self {
+            Self::LanePowerExpiry { lane, at } => Event::LanePowerOffExpired { lane, at },
+            Self::OfficialStart { at } => Event::OfficialStart { at },
+            Self::RaceResume { at } => Event::RaceResumed { at },
+            Self::TimeFinish { at } => Event::FinishConditionReached {
+                at,
+                leader_lane: finish::condition_leader(state),
             },
         }
     }
@@ -57,60 +45,38 @@ pub(crate) fn earliest(
 
     for lane in &state.lanes {
         if let Some(at) = lane.power_off_until {
-            due.push(Due {
+            due.push(Due::LanePowerExpiry {
+                lane: lane.lane,
                 at,
-                kind: DueKind::LanePowerExpiry,
-                lane: Some(lane.lane),
             });
         }
     }
 
     match (&active.control, &active.lifecycle) {
-        (RaceControl::Live, Lifecycle::Starting { start_due_at }) => due.push(Due {
-            at: *start_due_at,
-            kind: DueKind::OfficialStart,
-            lane: None,
-        }),
+        (RaceControl::Live, Lifecycle::Starting { start_due_at }) => {
+            due.push(Due::OfficialStart { at: *start_due_at });
+        }
         (RaceControl::Live, Lifecycle::Running { official_start_at }) => {
             if let FinishCondition::TimeMs(duration) = active.config.finish_condition {
                 let at = official_start_at
                     .checked_add(duration)
                     .and_then(|at| at.checked_add(active.accumulated_pause_ms))
                     .ok_or(DomainError::InvalidDuration)?;
-                due.push(Due {
-                    at,
-                    kind: DueKind::TimeFinish,
-                    lane: None,
-                });
+                due.push(Due::TimeFinish { at });
             }
         }
-        (RaceControl::Restarting { restart_due_at, .. }, _) => due.push(Due {
-            at: *restart_due_at,
-            kind: DueKind::RaceResume,
-            lane: None,
-        }),
+        (RaceControl::Restarting { restart_due_at, .. }, _) => {
+            due.push(Due::RaceResume {
+                at: *restart_due_at,
+            });
+        }
         _ => {}
     }
 
     Ok(due
         .into_iter()
-        .filter(|due| due.at <= through)
-        .min_by_key(|due| (due.at, due.kind.priority(), due.lane)))
-}
-
-pub(crate) fn condition_leader(state: &RaceState) -> u8 {
-    state
-        .lanes
-        .iter()
-        .min_by_key(|lane| {
-            (
-                std::cmp::Reverse(lane.laps),
-                lane.last_valid_at.unwrap_or(ProtocolMillis::MAX),
-                lane.lane,
-            )
-        })
-        .expect("an active race has lanes")
-        .lane
+        .filter(|due| due.key().0 <= through)
+        .min_by_key(|due| due.key()))
 }
 
 #[cfg(test)]
@@ -120,35 +86,19 @@ mod tests {
     #[test]
     fn equal_timestamp_priority_is_explicit() {
         let mut due = [
-            Due {
-                at: 10,
-                kind: DueKind::TimeFinish,
-                lane: None,
-            },
-            Due {
-                at: 10,
-                kind: DueKind::RaceResume,
-                lane: None,
-            },
-            Due {
-                at: 10,
-                kind: DueKind::OfficialStart,
-                lane: None,
-            },
-            Due {
-                at: 10,
-                kind: DueKind::LanePowerExpiry,
-                lane: Some(1),
-            },
+            Due::TimeFinish { at: 10 },
+            Due::RaceResume { at: 10 },
+            Due::OfficialStart { at: 10 },
+            Due::LanePowerExpiry { lane: 1, at: 10 },
         ];
-        due.sort_by_key(|due| (due.at, due.kind.priority(), due.lane));
+        due.sort_by_key(|due| due.key());
         assert_eq!(
-            due.map(|due| due.kind),
+            due,
             [
-                DueKind::LanePowerExpiry,
-                DueKind::OfficialStart,
-                DueKind::RaceResume,
-                DueKind::TimeFinish,
+                Due::LanePowerExpiry { lane: 1, at: 10 },
+                Due::OfficialStart { at: 10 },
+                Due::RaceResume { at: 10 },
+                Due::TimeFinish { at: 10 },
             ]
         );
     }

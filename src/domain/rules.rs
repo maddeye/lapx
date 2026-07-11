@@ -1,9 +1,16 @@
 use super::{
     ActiveRace, ChaosSource, Command, Consequence, DomainError, Event, FinishCondition, LaneState,
-    Lifecycle, RaceConfig, RaceControl, RaceState, RaceStatus, RejectionReason, condition_leader,
-    finish, validate_config,
+    Lifecycle, RaceConfig, RaceControl, RaceState, RaceStatus, RejectionReason, finish,
+    validate_config,
 };
 use std::collections::VecDeque;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventOrigin {
+    Root,
+    Expected,
+    Scheduled,
+}
 
 pub(crate) fn command_root(
     state: &RaceState,
@@ -76,13 +83,12 @@ pub(crate) fn command_root(
 pub(crate) fn apply(
     state: &mut RaceState,
     event: &Event,
-    expected: bool,
-    scheduled: bool,
+    origin: EventOrigin,
     followups: &mut VecDeque<Event>,
 ) -> Result<(), DomainError> {
     match event {
         Event::RaceConfigured { config, at }
-            if !expected
+            if origin == EventOrigin::Root
                 && matches!(state.status, RaceStatus::Ready)
                 && state.last_event_at.is_none() =>
         {
@@ -99,22 +105,26 @@ pub(crate) fn apply(
             followups.push_back(Event::StartSequenceStarted { due_at, at: *at });
         }
         Event::StartSequenceStarted { due_at, .. }
-            if expected
+            if origin == EventOrigin::Expected
                 && matches!(
                     state.active().map(|race| &race.lifecycle),
                     Some(Lifecycle::Starting { start_due_at }) if start_due_at == due_at
                 ) => {}
-        Event::OfficialStart { at } if scheduled => start_official(state, *at)?,
-        Event::MeasurementCaptured { lane, at, .. } if !expected => {
+        Event::OfficialStart { at } if origin == EventOrigin::Scheduled => {
+            start_official(state, *at)?
+        }
+        Event::MeasurementCaptured { lane, at, .. } if origin == EventOrigin::Root => {
             capture_measurement(state, *lane, *at, followups)?
         }
-        Event::MeasurementRejected { .. } if expected => {}
+        Event::MeasurementRejected { .. } if origin == EventOrigin::Expected => {}
         Event::ValidLap {
             lane,
             at,
             lap_time_ms,
-        } if expected => apply_valid_lap(state, *lane, *at, *lap_time_ms, followups)?,
-        Event::FalseStartDetected { lane, at } if expected => {
+        } if origin == EventOrigin::Expected => {
+            apply_valid_lap(state, *lane, *at, *lap_time_ms, followups)?
+        }
+        Event::FalseStartDetected { lane, at } if origin == EventOrigin::Expected => {
             let consequence = state
                 .config()
                 .ok_or(DomainError::InvalidEventOrder)?
@@ -125,24 +135,25 @@ pub(crate) fn apply(
             lane,
             consequence,
             at,
-        } if expected => apply_consequence(state, *lane, *consequence, *at)?,
+        } if origin == EventOrigin::Expected => apply_consequence(state, *lane, *consequence, *at)?,
         Event::RacePaused { at }
-            if (expected
-                || matches!(
-                    state.active().map(|race| &race.control),
-                    Some(RaceControl::Live)
-                )) =>
+            if (origin == EventOrigin::Expected
+                || (origin == EventOrigin::Root
+                    && matches!(
+                        state.active().map(|race| &race.control),
+                        Some(RaceControl::Live)
+                    ))) =>
         {
             pause(state, *at)?
         }
-        Event::RestartSequencePlanned { due_at, at } if !expected => {
+        Event::RestartSequencePlanned { due_at, at } if origin == EventOrigin::Root => {
             plan_restart(state, *at, *due_at)?
         }
-        Event::RaceResumed { at } if scheduled => resume(state, *at)?,
-        Event::ChaosTriggered { source, at } if !expected => {
+        Event::RaceResumed { at } if origin == EventOrigin::Scheduled => resume(state, *at)?,
+        Event::ChaosTriggered { source, at } if origin == EventOrigin::Root => {
             trigger_chaos(state, *source, *at, followups)?
         }
-        Event::LanePowerOffExpired { lane, at } if scheduled => {
+        Event::LanePowerOffExpired { lane, at } if origin == EventOrigin::Scheduled => {
             let lane = state
                 .lane_mut(*lane)
                 .ok_or(DomainError::InvalidEventOrder)?;
@@ -150,16 +161,20 @@ pub(crate) fn apply(
                 return Err(DomainError::InvalidEventOrder);
             }
         }
-        Event::FinishConditionReached { at, leader_lane } if expected || scheduled => {
+        Event::FinishConditionReached { at, leader_lane }
+            if matches!(origin, EventOrigin::Expected | EventOrigin::Scheduled) =>
+        {
             finish::start(state, *at, *leader_lane, followups)?
         }
-        Event::LaneFinished { lane, at } if expected => finish::lane(state, *lane, *at, followups)?,
-        Event::RaceFinished { at } if expected => finish::race(state, *at)?,
+        Event::LaneFinished { lane, at } if origin == EventOrigin::Expected => {
+            finish::lane(state, *lane, *at, followups)?
+        }
+        Event::RaceFinished { at } if origin == EventOrigin::Expected => finish::race(state, *at)?,
         Event::LapCorrectionApplied {
             lane,
             delta_thousandths,
             ..
-        } if !expected && matches!(state.status, RaceStatus::Finished(_)) => {
+        } if origin == EventOrigin::Root && matches!(state.status, RaceStatus::Finished(_)) => {
             let lane = state
                 .lane_mut(*lane)
                 .ok_or(DomainError::InvalidEventOrder)?;
@@ -416,7 +431,7 @@ fn apply_valid_lap(
         {
             followups.push_back(Event::FinishConditionReached {
                 at,
-                leader_lane: condition_leader(state),
+                leader_lane: finish::condition_leader(state),
             });
         }
         Lifecycle::Finishing { .. } => finish::after_valid_lap(state, lane, at, followups)?,
