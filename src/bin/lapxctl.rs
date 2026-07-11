@@ -1,5 +1,5 @@
 use lapx::{
-    domain::{Command, RaceConfig, SignalEdge},
+    domain::{ChaosSource, Command, RaceConfig, SignalEdge},
     store::SqliteStore,
 };
 use serde::Deserialize;
@@ -34,6 +34,17 @@ struct CorrectInput {
     delta_thousandths: i64,
     at: u64,
 }
+#[derive(Deserialize)]
+struct TimedInput {
+    race_id: String,
+    at: u64,
+}
+#[derive(Deserialize)]
+struct ChaosInput {
+    race_id: String,
+    source: ChaosSource,
+    at: u64,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -45,7 +56,10 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args.len() != 3 || args[1] != "--json" {
-        return Err("usage: lapxctl <start|advance|sensor|correct> --json <file|->".into());
+        return Err(
+            "usage: lapxctl <start|advance|sensor|correct|pause|resume|chaos> --json <file|->"
+                .into(),
+        );
     }
     let json = if args[2] == "-" {
         let mut input = String::new();
@@ -107,6 +121,27 @@ fn parse_command(name: &str, json: &str) -> Result<(String, Command), String> {
                 Command::CorrectLaps {
                     lane: input.lane,
                     delta_thousandths: input.delta_thousandths,
+                    at: input.at,
+                },
+            ))
+        }
+        "pause" | "resume" => {
+            let input: TimedInput =
+                serde_json::from_str(json).map_err(|error| error.to_string())?;
+            let command = if name == "pause" {
+                Command::PauseRace { at: input.at }
+            } else {
+                Command::ResumeRace { at: input.at }
+            };
+            Ok((input.race_id, command))
+        }
+        "chaos" => {
+            let input: ChaosInput =
+                serde_json::from_str(json).map_err(|error| error.to_string())?;
+            Ok((
+                input.race_id,
+                Command::TriggerChaos {
+                    source: input.source,
                     at: input.at,
                 },
             ))

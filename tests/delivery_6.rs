@@ -15,9 +15,12 @@ fn config() -> RaceConfig {
     RaceConfig {
         lanes: 2,
         start_sequence_ms: 10,
+        restart_sequence_ms: 5,
         minimum_lap_time_ms: 100,
         finish_condition: FinishCondition::Laps(10),
         finish_mode: FinishMode::Immediate,
+        false_start_consequence: Consequence::Abort,
+        chaos_consequence: Consequence::Abort,
     }
 }
 

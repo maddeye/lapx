@@ -1,18 +1,33 @@
 use super::{
-    Command, DomainError, Event, FinishCondition, FinishMode, LaneState, ProtocolMillis,
-    RaceConfig, RacePhase, RaceState, RejectionReason, validate_config,
+    ChaosSource, Command, Consequence, DomainError, Event, FinishCondition, FinishMode, LaneState,
+    ProtocolMillis, RaceConfig, RacePhase, RaceState, RejectionReason, SuspendedPhase,
+    validate_config,
 };
 
 #[derive(Clone, Debug)]
 enum Pending {
     Event(Event),
-    Start { event: Event, config: RaceConfig },
+    Start {
+        event: Event,
+        config: RaceConfig,
+    },
+    FalseStart {
+        event: Event,
+        consequence: Event,
+    },
+    Pause {
+        event: Event,
+        consequence: Option<Event>,
+    },
 }
 
 impl Pending {
     fn event(&self) -> &Event {
         match self {
-            Self::Event(event) | Self::Start { event, .. } => event,
+            Self::Event(event)
+            | Self::Start { event, .. }
+            | Self::FalseStart { event, .. }
+            | Self::Pause { event, .. } => event,
         }
     }
 }
@@ -106,19 +121,43 @@ impl RaceEngine {
                 _ => Err(DomainError::InvalidPhase),
             };
         }
+        if matches!(engine.state.phase, RacePhase::Aborted { .. }) {
+            return if events.is_empty() {
+                Err(DomainError::InvalidPhase)
+            } else {
+                Ok(events)
+            };
+        }
 
         match command {
             Command::AdvanceRace { .. } => Ok(events),
-            Command::SensorTriggered { lane, at, edge }
-                if matches!(
-                    engine.state.phase,
-                    RacePhase::Running { .. } | RacePhase::Finishing { .. }
-                ) =>
-            {
+            Command::SensorTriggered { lane, at, edge } if engine.accepts_measurement() => {
                 if engine.state.lane(lane).is_none() {
                     return Err(DomainError::InvalidLane);
                 }
                 engine.emit(Event::MeasurementCaptured { lane, at, edge }, &mut events)?;
+                Ok(events)
+            }
+            Command::PauseRace { at } if engine.state.phase.active().is_some() => {
+                engine.emit(Event::RacePaused { at }, &mut events)?;
+                Ok(events)
+            }
+            Command::ResumeRace { at }
+                if matches!(engine.state.phase, RacePhase::Paused { .. }) =>
+            {
+                let due_at = at
+                    .checked_add(engine.state.config().unwrap().restart_sequence_ms)
+                    .ok_or(DomainError::InvalidDuration)?;
+                engine.emit(Event::RestartSequencePlanned { due_at, at }, &mut events)?;
+                Ok(events)
+            }
+            Command::TriggerChaos { source, at } if engine.state.phase.active().is_some() => {
+                if let ChaosSource::Lane(lane) = source
+                    && engine.state.lane(lane).is_none()
+                {
+                    return Err(DomainError::InvalidLane);
+                }
+                engine.emit(Event::ChaosTriggered { source, at }, &mut events)?;
                 Ok(events)
             }
             _ => Err(DomainError::InvalidPhase),
@@ -206,18 +245,71 @@ impl RaceEngine {
             {
                 self.start_official(event)?;
             }
+            Event::RaceResumed { .. }
+                if self.due_event(event.timestamp())? == Some(event.clone()) =>
+            {
+                self.resume(event.timestamp())?;
+            }
+            Event::LanePowerOffExpired { lane, .. }
+                if self.due_event(event.timestamp())? == Some(event.clone()) =>
+            {
+                let lane = self
+                    .state
+                    .lane_mut(*lane)
+                    .ok_or(DomainError::InvalidEventOrder)?;
+                if lane.power_off_until.take() != Some(event.timestamp()) {
+                    return Err(DomainError::InvalidEventOrder);
+                }
+            }
             Event::FinishConditionReached { .. }
                 if self.due_event(event.timestamp())? == Some(event.clone()) =>
             {
                 self.start_finishing(event)?;
             }
-            Event::MeasurementCaptured { lane, at, .. }
-                if matches!(
-                    self.state.phase,
-                    RacePhase::Running { .. } | RacePhase::Finishing { .. }
-                ) =>
+            Event::MeasurementCaptured { lane, at, .. } if self.accepts_measurement() => {
+                if self.measurement_is_false_start() {
+                    self.expect_false_start(*lane, *at)?;
+                } else {
+                    self.expect_measurement_result(*lane, *at)?;
+                }
+            }
+            Event::RacePaused { at } if self.state.phase.active().is_some() => {
+                self.pause(*at)?;
+            }
+            Event::RestartSequencePlanned { due_at, at }
+                if matches!(self.state.phase, RacePhase::Paused { .. })
+                    && at.checked_add(self.state.config().unwrap().restart_sequence_ms)
+                        == Some(*due_at) =>
             {
-                self.expect_measurement_result(*lane, *at)?;
+                let RacePhase::Paused {
+                    suspended,
+                    paused_at,
+                } = self.state.phase.clone()
+                else {
+                    unreachable!()
+                };
+                self.state.phase = RacePhase::Restarting {
+                    suspended,
+                    paused_at,
+                    restart_due_at: *due_at,
+                };
+            }
+            Event::ChaosTriggered { source, at } if self.state.phase.active().is_some() => {
+                let consequence = match source {
+                    ChaosSource::RaceControl => None,
+                    ChaosSource::Lane(lane) if self.state.lane(*lane).is_some() => {
+                        Some(self.consequence_event(
+                            *lane,
+                            self.state.config().unwrap().chaos_consequence,
+                            *at,
+                        )?)
+                    }
+                    ChaosSource::Lane(_) => return Err(DomainError::InvalidEventOrder),
+                };
+                self.pending = Some(Pending::Pause {
+                    event: Event::RacePaused { at: *at },
+                    consequence,
+                });
             }
             Event::LapCorrectionApplied {
                 lane,
@@ -240,11 +332,8 @@ impl RaceEngine {
     }
 
     fn accept_expected(&mut self, event: &Event, pending: Pending) -> Result<(), DomainError> {
-        match event {
-            Event::StartSequenceStarted { due_at, .. } => {
-                let Pending::Start { config, .. } = pending else {
-                    return Err(DomainError::InvalidEventOrder);
-                };
+        match (event, pending) {
+            (Event::StartSequenceStarted { due_at, .. }, Pending::Start { config, .. }) => {
                 self.state.lanes = (1..=config.lanes)
                     .map(|lane| LaneState {
                         lane,
@@ -254,6 +343,9 @@ impl RaceEngine {
                         best_lap_ms: None,
                         last_valid_at: None,
                         finished_at: None,
+                        race_time_ms: None,
+                        result_time_penalty_ms: 0,
+                        power_off_until: None,
                     })
                     .collect();
                 self.state.phase = RacePhase::Starting {
@@ -261,42 +353,122 @@ impl RaceEngine {
                     start_due_at: *due_at,
                 };
             }
-            Event::MeasurementRejected { .. } => {}
-            Event::ValidLap {
-                lane,
-                at,
-                lap_time_ms,
-            } => self.apply_valid_lap(*lane, *at, *lap_time_ms)?,
-            Event::FinishConditionReached { .. } => self.start_finishing(event)?,
-            Event::LaneFinished { lane, at } => self.finish_lane(*lane, *at)?,
-            Event::RaceFinished { at } => self.finish_race(*at)?,
+            (Event::FalseStartDetected { .. }, Pending::FalseStart { consequence, .. }) => {
+                self.pending = Some(Pending::Event(consequence))
+            }
+            (Event::RacePaused { at }, Pending::Pause { consequence, .. }) => {
+                self.pause(*at)?;
+                self.pending = consequence.map(Pending::Event);
+            }
+            (
+                Event::ConsequenceApplied {
+                    lane,
+                    consequence,
+                    at,
+                },
+                Pending::Event(_),
+            ) => {
+                self.apply_consequence(*lane, consequence, *at)?;
+            }
+            (Event::MeasurementRejected { .. }, Pending::Event(_)) => {}
+            (
+                Event::ValidLap {
+                    lane,
+                    at,
+                    lap_time_ms,
+                },
+                Pending::Event(_),
+            ) => self.apply_valid_lap(*lane, *at, *lap_time_ms)?,
+            (Event::FinishConditionReached { .. }, Pending::Event(_)) => {
+                self.start_finishing(event)?
+            }
+            (Event::LaneFinished { lane, at }, Pending::Event(_)) => {
+                self.finish_lane(*lane, *at)?
+            }
+            (Event::RaceFinished { at }, Pending::Event(_)) => self.finish_race(*at)?,
             _ => return Err(DomainError::InvalidEventOrder),
         }
         Ok(())
     }
 
     fn due_event(&self, to: ProtocolMillis) -> Result<Option<Event>, DomainError> {
+        if matches!(
+            self.state.phase,
+            RacePhase::Finished { .. } | RacePhase::Aborted { .. }
+        ) {
+            return Ok(None);
+        }
+        let mut due = vec![];
         match &self.state.phase {
-            RacePhase::Starting { start_due_at, .. } if *start_due_at <= to => {
-                Ok(Some(Event::OfficialStart { at: *start_due_at }))
+            RacePhase::Starting { start_due_at, .. } => {
+                due.push(Event::OfficialStart { at: *start_due_at });
             }
             RacePhase::Running {
                 config,
                 official_start_at,
+                paused_ms,
             } => {
-                let FinishCondition::TimeMs(duration) = config.finish_condition else {
-                    return Ok(None);
-                };
-                let at = official_start_at
-                    .checked_add(duration)
-                    .ok_or(DomainError::InvalidDuration)?;
-                Ok((at <= to).then(|| Event::FinishConditionReached {
-                    at,
-                    leader_lane: condition_leader(&self.state),
-                }))
+                if let FinishCondition::TimeMs(duration) = config.finish_condition {
+                    let at = official_start_at
+                        .checked_add(duration)
+                        .and_then(|at| at.checked_add(*paused_ms))
+                        .ok_or(DomainError::InvalidDuration)?;
+                    due.push(Event::FinishConditionReached {
+                        at,
+                        leader_lane: condition_leader(&self.state),
+                    });
+                }
             }
-            _ => Ok(None),
+            RacePhase::Restarting { restart_due_at, .. } => {
+                due.push(Event::RaceResumed {
+                    at: *restart_due_at,
+                });
+            }
+            _ => {}
         }
+        due.extend(self.state.lanes.iter().filter_map(|lane| {
+            lane.power_off_until.map(|at| Event::LanePowerOffExpired {
+                lane: lane.lane,
+                at,
+            })
+        }));
+        due.retain(|event| event.timestamp() <= to);
+        due.sort_by_key(|event| (event.timestamp(), event.event_type(), event.lane()));
+        Ok(due.into_iter().next())
+    }
+
+    fn accepts_measurement(&self) -> bool {
+        matches!(
+            self.state.phase,
+            RacePhase::Starting { .. }
+                | RacePhase::Running { .. }
+                | RacePhase::Finishing { .. }
+                | RacePhase::Paused { .. }
+        )
+    }
+
+    fn measurement_is_false_start(&self) -> bool {
+        matches!(self.active_phase(), Some(SuspendedPhase::Starting { .. }))
+    }
+
+    fn active_phase(&self) -> Option<SuspendedPhase> {
+        match &self.state.phase {
+            RacePhase::Paused { suspended, .. } | RacePhase::Restarting { suspended, .. } => {
+                Some(suspended.clone())
+            }
+            phase => phase.active(),
+        }
+    }
+
+    fn set_active_phase(&mut self, active: SuspendedPhase) -> Result<(), DomainError> {
+        match &mut self.state.phase {
+            RacePhase::Paused { suspended, .. } | RacePhase::Restarting { suspended, .. } => {
+                *suspended = active;
+            }
+            phase if phase.active().is_some() => *phase = RacePhase::from_active(active),
+            _ => return Err(DomainError::InvalidEventOrder),
+        }
+        Ok(())
     }
 
     fn start_official(&mut self, event: &Event) -> Result<(), DomainError> {
@@ -316,7 +488,137 @@ impl RaceEngine {
         self.state.phase = RacePhase::Running {
             config: config.clone(),
             official_start_at: *at,
+            paused_ms: 0,
         };
+        Ok(())
+    }
+
+    fn expect_false_start(&mut self, lane: u8, at: ProtocolMillis) -> Result<(), DomainError> {
+        if self.state.lane(lane).is_none() {
+            return Err(DomainError::InvalidEventOrder);
+        }
+        let consequence = self.consequence_event(
+            lane,
+            self.state.config().unwrap().false_start_consequence,
+            at,
+        )?;
+        self.pending = Some(Pending::FalseStart {
+            event: Event::FalseStartDetected { lane, at },
+            consequence,
+        });
+        Ok(())
+    }
+
+    fn consequence_event(
+        &self,
+        lane: u8,
+        consequence: Consequence,
+        at: ProtocolMillis,
+    ) -> Result<Event, DomainError> {
+        if let Consequence::LanePowerOffMs(duration) = consequence {
+            at.checked_add(duration)
+                .ok_or(DomainError::InvalidDuration)?;
+            Ok(Event::ConsequenceApplied {
+                lane,
+                consequence: Consequence::LanePowerOffMs(duration),
+                at,
+            })
+        } else {
+            Ok(Event::ConsequenceApplied {
+                lane,
+                consequence,
+                at,
+            })
+        }
+    }
+
+    fn apply_consequence(
+        &mut self,
+        lane: u8,
+        consequence: &Consequence,
+        at: ProtocolMillis,
+    ) -> Result<(), DomainError> {
+        if self.state.lane(lane).is_none() {
+            return Err(DomainError::InvalidEventOrder);
+        }
+        match consequence {
+            Consequence::Abort => {
+                let config = self.state.config().unwrap().clone();
+                self.state.phase = RacePhase::Aborted {
+                    config,
+                    aborted_at: at,
+                };
+            }
+            Consequence::ResultTimePenaltyMs(penalty) => {
+                let lane = self.state.lane_mut(lane).unwrap();
+                let total = lane
+                    .result_time_penalty_ms
+                    .checked_add(*penalty)
+                    .ok_or(DomainError::InvalidDuration)?;
+                if lane
+                    .race_time_ms
+                    .is_some_and(|time| time.checked_add(total).is_none())
+                {
+                    return Err(DomainError::InvalidDuration);
+                }
+                lane.result_time_penalty_ms = total;
+            }
+            Consequence::LanePowerOffMs(duration) => {
+                let until = at
+                    .checked_add(*duration)
+                    .ok_or(DomainError::InvalidDuration)?;
+                let lane = self.state.lane_mut(lane).unwrap();
+                lane.power_off_until =
+                    Some(lane.power_off_until.map_or(until, |old| old.max(until)));
+            }
+        }
+        Ok(())
+    }
+
+    fn pause(&mut self, at: ProtocolMillis) -> Result<(), DomainError> {
+        let suspended = self
+            .state
+            .phase
+            .active()
+            .ok_or(DomainError::InvalidEventOrder)?;
+        self.state.phase = RacePhase::Paused {
+            suspended,
+            paused_at: at,
+        };
+        Ok(())
+    }
+
+    fn resume(&mut self, at: ProtocolMillis) -> Result<(), DomainError> {
+        let RacePhase::Restarting {
+            suspended,
+            paused_at,
+            restart_due_at,
+        } = self.state.phase.clone()
+        else {
+            return Err(DomainError::InvalidEventOrder);
+        };
+        if at != restart_due_at {
+            return Err(DomainError::InvalidEventOrder);
+        }
+        let paused_duration = at
+            .checked_sub(paused_at)
+            .ok_or(DomainError::InvalidEventOrder)?;
+        let active = suspended
+            .shifted(paused_duration)
+            .map_err(|()| DomainError::InvalidDuration)?;
+        if let SuspendedPhase::Running {
+            config,
+            official_start_at,
+            paused_ms,
+        } = &active
+            && let FinishCondition::TimeMs(duration) = config.finish_condition
+        {
+            official_start_at
+                .checked_add(duration)
+                .and_then(|due| due.checked_add(*paused_ms))
+                .ok_or(DomainError::InvalidDuration)?;
+        }
+        self.state.phase = RacePhase::from_active(active);
         Ok(())
     }
 
@@ -387,22 +689,22 @@ impl RaceEngine {
         );
         lane_state.last_valid_at = Some(at);
 
-        match &self.state.phase {
-            RacePhase::Running { config, .. } if matches!(config.finish_condition, FinishCondition::Laps(target) if self.state.lane(lane).unwrap().laps >= target) =>
+        match self.active_phase() {
+            Some(SuspendedPhase::Running { config, .. }) if matches!(config.finish_condition, FinishCondition::Laps(target) if self.state.lane(lane).unwrap().laps >= target) =>
             {
                 self.pending = Some(Pending::Event(Event::FinishConditionReached {
                     at,
                     leader_lane: condition_leader(&self.state),
                 }));
             }
-            RacePhase::Finishing {
+            Some(SuspendedPhase::Finishing {
                 config,
                 condition_leader,
                 ..
-            } if config.finish_mode == FinishMode::LeaderLap && *condition_leader == lane => {
+            }) if config.finish_mode == FinishMode::LeaderLap && condition_leader == lane => {
                 self.expect_first_unfinished(at)?;
             }
-            RacePhase::Finishing { config, .. }
+            Some(SuspendedPhase::Finishing { config, .. })
                 if config.finish_mode == FinishMode::AllCurrentLap =>
             {
                 self.pending = Some(Pending::Event(Event::LaneFinished { lane, at }));
@@ -416,24 +718,24 @@ impl RaceEngine {
         let Event::FinishConditionReached { at, leader_lane } = event else {
             return Err(DomainError::InvalidEventOrder);
         };
-        let RacePhase::Running {
+        let Some(SuspendedPhase::Running {
             config,
             official_start_at,
-        } = &self.state.phase
+            paused_ms,
+        }) = self.active_phase()
         else {
             return Err(DomainError::InvalidEventOrder);
         };
-        let config = config.clone();
-        let official_start_at = *official_start_at;
         if *leader_lane != condition_leader(&self.state) {
             return Err(DomainError::InvalidEventOrder);
         }
-        self.state.phase = RacePhase::Finishing {
+        self.set_active_phase(SuspendedPhase::Finishing {
             config: config.clone(),
             official_start_at,
+            paused_ms,
             finish_condition_at: *at,
             condition_leader: *leader_lane,
-        };
+        })?;
 
         match config.finish_mode {
             FinishMode::Immediate => self.expect_first_unfinished(*at)?,
@@ -468,6 +770,10 @@ impl RaceEngine {
     }
 
     fn finish_lane(&mut self, lane: u8, at: ProtocolMillis) -> Result<(), DomainError> {
+        let race_time_ms = self
+            .state
+            .race_elapsed_ms(at)
+            .ok_or(DomainError::InvalidEventOrder)?;
         let lane_state = self
             .state
             .lane_mut(lane)
@@ -475,6 +781,10 @@ impl RaceEngine {
         if lane_state.finished_at.replace(at).is_some() {
             return Err(DomainError::InvalidEventOrder);
         }
+        race_time_ms
+            .checked_add(lane_state.result_time_penalty_ms)
+            .ok_or(DomainError::InvalidDuration)?;
+        lane_state.race_time_ms = Some(race_time_ms);
 
         if self
             .state
@@ -501,20 +811,30 @@ impl RaceEngine {
         {
             return Err(DomainError::InvalidEventOrder);
         }
-        let RacePhase::Finishing {
+        let Some(SuspendedPhase::Finishing {
             config,
             official_start_at,
+            mut paused_ms,
             finish_condition_at,
             condition_leader,
-        } = &self.state.phase
+        }) = self.active_phase()
         else {
             return Err(DomainError::InvalidEventOrder);
         };
+        if let RacePhase::Paused { paused_at, .. } = self.state.phase {
+            paused_ms = paused_ms
+                .checked_add(
+                    at.checked_sub(paused_at)
+                        .ok_or(DomainError::InvalidEventOrder)?,
+                )
+                .ok_or(DomainError::InvalidDuration)?;
+        }
         self.state.phase = RacePhase::Finished {
-            config: config.clone(),
-            official_start_at: *official_start_at,
-            finish_condition_at: *finish_condition_at,
-            condition_leader: *condition_leader,
+            config,
+            official_start_at,
+            paused_ms,
+            finish_condition_at,
+            condition_leader,
             finished_at: at,
         };
         Ok(())

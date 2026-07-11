@@ -4,9 +4,12 @@ fn config(condition: FinishCondition, mode: FinishMode) -> RaceConfig {
     RaceConfig {
         lanes: 2,
         start_sequence_ms: 10,
+        restart_sequence_ms: 5,
         minimum_lap_time_ms: 100,
         finish_condition: condition,
         finish_mode: mode,
+        false_start_consequence: Consequence::Abort,
+        chaos_consequence: Consequence::Abort,
     }
 }
 fn start(condition: FinishCondition, mode: FinishMode) -> Vec<Event> {

@@ -17,13 +17,33 @@ pub enum FinishMode {
     AllCurrentLap,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Consequence {
+    Abort,
+    ResultTimePenaltyMs(ProtocolMillis),
+    LanePowerOffMs(ProtocolMillis),
+}
+
+impl Consequence {
+    pub(crate) fn duration(&self) -> Option<ProtocolMillis> {
+        match self {
+            Self::Abort => None,
+            Self::ResultTimePenaltyMs(duration) | Self::LanePowerOffMs(duration) => Some(*duration),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaceConfig {
     pub lanes: u8,
     pub start_sequence_ms: ProtocolMillis,
+    pub restart_sequence_ms: ProtocolMillis,
     pub minimum_lap_time_ms: ProtocolMillis,
     pub finish_condition: FinishCondition,
     pub finish_mode: FinishMode,
+    pub false_start_consequence: Consequence,
+    pub chaos_consequence: Consequence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +51,13 @@ pub struct RaceConfig {
 pub enum SignalEdge {
     Rising,
     Falling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChaosSource {
+    RaceControl,
+    Lane(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +80,16 @@ pub enum Command {
         delta_thousandths: i64,
         at: ProtocolMillis,
     },
+    PauseRace {
+        at: ProtocolMillis,
+    },
+    ResumeRace {
+        at: ProtocolMillis,
+    },
+    TriggerChaos {
+        source: ChaosSource,
+        at: ProtocolMillis,
+    },
 }
 
 impl Command {
@@ -60,7 +97,10 @@ impl Command {
         match self {
             Self::StartRace { at, .. }
             | Self::SensorTriggered { at, .. }
-            | Self::CorrectLaps { at, .. } => *at,
+            | Self::CorrectLaps { at, .. }
+            | Self::PauseRace { at }
+            | Self::ResumeRace { at }
+            | Self::TriggerChaos { at, .. } => *at,
             Self::AdvanceRace { to } => *to,
         }
     }
@@ -102,6 +142,33 @@ pub enum Event {
         at: ProtocolMillis,
         lap_time_ms: ProtocolMillis,
     },
+    FalseStartDetected {
+        lane: u8,
+        at: ProtocolMillis,
+    },
+    ConsequenceApplied {
+        lane: u8,
+        consequence: Consequence,
+        at: ProtocolMillis,
+    },
+    RacePaused {
+        at: ProtocolMillis,
+    },
+    RestartSequencePlanned {
+        due_at: ProtocolMillis,
+        at: ProtocolMillis,
+    },
+    RaceResumed {
+        at: ProtocolMillis,
+    },
+    ChaosTriggered {
+        source: ChaosSource,
+        at: ProtocolMillis,
+    },
+    LanePowerOffExpired {
+        lane: u8,
+        at: ProtocolMillis,
+    },
     FinishConditionReached {
         at: ProtocolMillis,
         leader_lane: u8,
@@ -129,6 +196,13 @@ impl Event {
             | Self::MeasurementCaptured { at, .. }
             | Self::MeasurementRejected { at, .. }
             | Self::ValidLap { at, .. }
+            | Self::FalseStartDetected { at, .. }
+            | Self::ConsequenceApplied { at, .. }
+            | Self::RacePaused { at }
+            | Self::RestartSequencePlanned { at, .. }
+            | Self::RaceResumed { at }
+            | Self::ChaosTriggered { at, .. }
+            | Self::LanePowerOffExpired { at, .. }
             | Self::FinishConditionReached { at, .. }
             | Self::LaneFinished { at, .. }
             | Self::RaceFinished { at }
@@ -144,10 +218,31 @@ impl Event {
             Self::MeasurementCaptured { .. } => "measurement_captured",
             Self::MeasurementRejected { .. } => "measurement_rejected",
             Self::ValidLap { .. } => "valid_lap",
+            Self::FalseStartDetected { .. } => "false_start_detected",
+            Self::ConsequenceApplied { .. } => "consequence_applied",
+            Self::RacePaused { .. } => "race_paused",
+            Self::RestartSequencePlanned { .. } => "restart_sequence_planned",
+            Self::RaceResumed { .. } => "race_resumed",
+            Self::ChaosTriggered { .. } => "chaos_triggered",
+            Self::LanePowerOffExpired { .. } => "lane_power_off_expired",
             Self::FinishConditionReached { .. } => "finish_condition_reached",
             Self::LaneFinished { .. } => "lane_finished",
             Self::RaceFinished { .. } => "race_finished",
             Self::LapCorrectionApplied { .. } => "lap_correction_applied",
+        }
+    }
+
+    pub(crate) fn lane(&self) -> u8 {
+        match self {
+            Self::MeasurementCaptured { lane, .. }
+            | Self::MeasurementRejected { lane, .. }
+            | Self::ValidLap { lane, .. }
+            | Self::FalseStartDetected { lane, .. }
+            | Self::ConsequenceApplied { lane, .. }
+            | Self::LanePowerOffExpired { lane, .. }
+            | Self::LaneFinished { lane, .. }
+            | Self::LapCorrectionApplied { lane, .. } => *lane,
+            _ => 0,
         }
     }
 }
@@ -171,7 +266,18 @@ pub(crate) fn validate_config(config: &RaceConfig) -> Result<(), DomainError> {
     if !(1..=4).contains(&config.lanes) {
         return Err(DomainError::InvalidLaneCount);
     }
-    if config.start_sequence_ms == 0 || config.minimum_lap_time_ms == 0 {
+    if config.start_sequence_ms == 0
+        || config.restart_sequence_ms == 0
+        || config.minimum_lap_time_ms == 0
+        || config
+            .false_start_consequence
+            .duration()
+            .is_some_and(|duration| duration == 0)
+        || config
+            .chaos_consequence
+            .duration()
+            .is_some_and(|duration| duration == 0)
+    {
         return Err(DomainError::InvalidDuration);
     }
     match config.finish_condition {
