@@ -87,7 +87,13 @@ fn lane_chaos_pauses_then_applies_configured_consequence() {
         ]
     );
     let state = RaceEngine::replay(&events).unwrap();
-    assert!(matches!(state.state().phase, RacePhase::Paused { .. }));
+    assert!(matches!(
+        state.state().status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { .. },
+            ..
+        })
+    ));
     assert_eq!(state.state().lane(2).unwrap().result_time_penalty_ms, 250);
 }
 
@@ -117,10 +123,54 @@ fn race_control_chaos_never_applies_a_consequence() {
             ]
         );
         assert!(matches!(
-            RaceEngine::replay(&events).unwrap().state().phase,
-            RacePhase::Paused { .. }
+            RaceEngine::replay(&events).unwrap().state().status,
+            RaceStatus::Active(ActiveRace {
+                control: RaceControl::Paused { .. },
+                ..
+            })
         ));
     }
+}
+
+#[test]
+fn chaos_while_paused_or_restarting_retains_the_original_pause() {
+    let mut events = running(Consequence::ResultTimePenaltyMs(250));
+    issue(&mut events, Command::PauseRace { at: 200 });
+    for (at, resume_first) in [(250, false), (320, true)] {
+        if resume_first {
+            issue(&mut events, Command::ResumeRace { at: 300 });
+        }
+        let emitted = issue(
+            &mut events,
+            Command::TriggerChaos {
+                source: ChaosSource::Lane(1),
+                at,
+            },
+        );
+        assert!(matches!(
+            emitted.as_slice(),
+            [
+                Event::ChaosTriggered { .. },
+                Event::RacePaused { .. },
+                Event::ConsequenceApplied { .. }
+            ]
+        ));
+        assert!(matches!(
+            RaceEngine::replay(&events).unwrap().state().status,
+            RaceStatus::Active(ActiveRace {
+                control: RaceControl::Paused { paused_at: 200 },
+                ..
+            })
+        ));
+    }
+    let state = RaceEngine::replay(&events).unwrap();
+    assert_eq!(state.state().lane(1).unwrap().result_time_penalty_ms, 500);
+    assert!(
+        state
+            .handle(Command::AdvanceRace { to: 350 })
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -178,8 +228,8 @@ fn aborting_lane_chaos_is_terminal() {
         ]
     ));
     assert!(matches!(
-        RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Aborted { .. }
+        RaceEngine::replay(&events).unwrap().state().status,
+        RaceStatus::Aborted
     ));
 }
 
@@ -273,7 +323,13 @@ fn chaos_cli_command_uses_durable_replay_path() {
             "at": 200,
         }),
     );
-    assert!(matches!(paused.phase, RacePhase::Paused { .. }));
+    assert!(matches!(
+        paused.status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { .. },
+            ..
+        })
+    ));
     assert_eq!(paused.lane(2).unwrap().result_time_penalty_ms, 250);
     let stored = SqliteStore::open(&db).unwrap().events("race").unwrap();
     assert!(matches!(

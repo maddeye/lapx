@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub type ProtocolMillis = u64;
 
@@ -26,15 +26,15 @@ pub enum Consequence {
 }
 
 impl Consequence {
-    pub(crate) fn duration(&self) -> Option<ProtocolMillis> {
+    pub(crate) fn duration(self) -> Option<ProtocolMillis> {
         match self {
             Self::Abort => None,
-            Self::ResultTimePenaltyMs(duration) | Self::LanePowerOffMs(duration) => Some(*duration),
+            Self::ResultTimePenaltyMs(duration) | Self::LanePowerOffMs(duration) => Some(duration),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RaceConfig {
     pub lanes: u8,
     pub start_sequence_ms: ProtocolMillis,
@@ -44,6 +44,37 @@ pub struct RaceConfig {
     pub finish_mode: FinishMode,
     pub false_start_consequence: Consequence,
     pub chaos_consequence: Consequence,
+}
+
+impl<'de> Deserialize<'de> for RaceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CompatibleConfig {
+            lanes: u8,
+            start_sequence_ms: ProtocolMillis,
+            restart_sequence_ms: Option<ProtocolMillis>,
+            minimum_lap_time_ms: ProtocolMillis,
+            finish_condition: FinishCondition,
+            finish_mode: FinishMode,
+            false_start_consequence: Option<Consequence>,
+            chaos_consequence: Option<Consequence>,
+        }
+
+        let value = CompatibleConfig::deserialize(deserializer)?;
+        Ok(Self {
+            lanes: value.lanes,
+            start_sequence_ms: value.start_sequence_ms,
+            restart_sequence_ms: value.restart_sequence_ms.unwrap_or(value.start_sequence_ms),
+            minimum_lap_time_ms: value.minimum_lap_time_ms,
+            finish_condition: value.finish_condition,
+            finish_mode: value.finish_mode,
+            false_start_consequence: value.false_start_consequence.unwrap_or(Consequence::Abort),
+            chaos_consequence: value.chaos_consequence.unwrap_or(Consequence::Abort),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,20 +260,6 @@ impl Event {
             Self::LaneFinished { .. } => "lane_finished",
             Self::RaceFinished { .. } => "race_finished",
             Self::LapCorrectionApplied { .. } => "lap_correction_applied",
-        }
-    }
-
-    pub(crate) fn lane(&self) -> u8 {
-        match self {
-            Self::MeasurementCaptured { lane, .. }
-            | Self::MeasurementRejected { lane, .. }
-            | Self::ValidLap { lane, .. }
-            | Self::FalseStartDetected { lane, .. }
-            | Self::ConsequenceApplied { lane, .. }
-            | Self::LanePowerOffExpired { lane, .. }
-            | Self::LaneFinished { lane, .. }
-            | Self::LapCorrectionApplied { lane, .. } => *lane,
-            _ => 0,
         }
     }
 }

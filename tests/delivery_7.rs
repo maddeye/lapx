@@ -143,13 +143,7 @@ fn abort_consequence_is_terminal() {
             .unwrap(),
     );
     let engine = RaceEngine::replay(&events).unwrap();
-    assert!(matches!(
-        engine.state().phase,
-        RacePhase::Aborted {
-            aborted_at: 200,
-            ..
-        }
-    ));
+    assert!(matches!(engine.state().status, RaceStatus::Aborted));
     assert_eq!(engine.state().intended_lane_power(1), Some(false));
     assert_eq!(
         engine.handle(Command::AdvanceRace { to: 10_000 }),

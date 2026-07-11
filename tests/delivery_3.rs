@@ -53,18 +53,28 @@ fn replay_at_uses_only_committed_events_through_timestamp() {
     );
 
     assert!(matches!(
-        RaceEngine::replay_at(&events, 1_099).unwrap().state().phase,
-        RacePhase::Starting {
-            start_due_at: 1_100,
+        RaceEngine::replay_at(&events, 1_099)
+            .unwrap()
+            .state()
+            .status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting {
+                start_due_at: 1_100,
+            },
             ..
-        }
+        })
     ));
     assert!(matches!(
-        RaceEngine::replay_at(&events, 1_100).unwrap().state().phase,
-        RacePhase::Running {
-            official_start_at: 1_100,
+        RaceEngine::replay_at(&events, 1_100)
+            .unwrap()
+            .state()
+            .status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Running {
+                official_start_at: 1_100,
+            },
             ..
-        }
+        })
     ));
     assert_eq!(
         RaceEngine::replay_at(&events, 4_099)
@@ -90,8 +100,11 @@ fn replay_at_uses_only_committed_events_through_timestamp() {
         RaceEngine::replay_at(&committed_before_due, 9_999)
             .unwrap()
             .state()
-            .phase,
-        RacePhase::Starting { .. }
+            .status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting { .. },
+            ..
+        })
     ));
 }
 

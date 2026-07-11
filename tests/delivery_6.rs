@@ -58,6 +58,42 @@ fn sqlite_store_replays_committed_events() {
 }
 
 #[test]
+fn literal_v1_sqlite_protocol_uses_backward_compatible_config_defaults() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lapx.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO race_events (race_id, sequence, event_type, schema_version, payload) VALUES (?1, ?2, ?3, 1, ?4)",
+            (
+                "old-race",
+                1,
+                "race_configured",
+                r#"{"type":"race_configured","config":{"lanes":2,"start_sequence_ms":10,"minimum_lap_time_ms":100,"finish_condition":{"laps":10},"finish_mode":"immediate"},"at":0}"#,
+            ),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO race_events (race_id, sequence, event_type, schema_version, payload) VALUES (?1, ?2, ?3, 1, ?4)",
+            (
+                "old-race",
+                2,
+                "start_sequence_started",
+                r#"{"type":"start_sequence_started","due_at":10,"at":0}"#,
+            ),
+        )
+        .unwrap();
+
+    let state = store.load("old-race").unwrap();
+    let config = state.config().unwrap();
+    assert_eq!(config.restart_sequence_ms, config.start_sequence_ms);
+    assert_eq!(config.false_start_consequence, Consequence::Abort);
+    assert_eq!(config.chaos_consequence, Consequence::Abort);
+}
+
+#[test]
 fn failed_command_leaves_protocol_and_state_unchanged_atomically() {
     let dir = tempdir().unwrap();
     let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
@@ -85,7 +121,13 @@ fn failed_command_leaves_protocol_and_state_unchanged_atomically() {
     ));
     assert_eq!(store.events("race").unwrap(), events_before);
     assert_eq!(store.load("race").unwrap(), before);
-    assert!(matches!(before.phase, RacePhase::Starting { .. }));
+    assert!(matches!(
+        before.status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting { .. },
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -191,7 +233,13 @@ fn store_cli() {
         String::from_utf8_lossy(&output.stderr)
     );
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(matches!(state.phase, RacePhase::Starting { .. }));
+    assert!(matches!(
+        state.status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting { .. },
+            ..
+        })
+    ));
 
     let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_lapxctl"))
         .args(["advance", "--json", "-"])
@@ -209,7 +257,13 @@ fn store_cli() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(matches!(state.phase, RacePhase::Running { .. }));
+    assert!(matches!(
+        state.status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Running { .. },
+            ..
+        })
+    ));
 
     let sensor = dir.path().join("sensor.json");
     std::fs::write(
@@ -224,7 +278,7 @@ fn store_cli() {
         .unwrap();
     assert!(output.status.success());
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(matches!(state.phase, RacePhase::Finished { .. }));
+    assert!(matches!(state.status, RaceStatus::Finished(_)));
 
     let correction = dir.path().join("correct.json");
     std::fs::write(

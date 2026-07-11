@@ -70,8 +70,11 @@ fn rennpause_freezes_elapsed_time_and_intended_power() {
     );
     let paused = RaceEngine::replay(&events).unwrap();
     assert!(matches!(
-        paused.state().phase,
-        RacePhase::Paused { paused_at: 400, .. }
+        paused.state().status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { paused_at: 400 },
+            ..
+        })
     ));
     assert_eq!(paused.state().race_elapsed_ms(900), Some(300));
     assert_eq!(paused.state().intended_lane_power(1), Some(false));
@@ -124,6 +127,63 @@ fn measurements_during_rennpause_use_protocol_timestamps() {
 }
 
 #[test]
+fn measurements_remain_valid_during_restart_for_each_lifecycle() {
+    let mut starting = RaceEngine::new()
+        .handle(Command::StartRace {
+            config: config(FinishCondition::Laps(10)),
+            at: 0,
+        })
+        .unwrap();
+    issue(&mut starting, Command::PauseRace { at: 25 });
+    issue(&mut starting, Command::ResumeRace { at: 50 });
+    let false_start = issue(
+        &mut starting,
+        Command::SensorTriggered {
+            lane: 1,
+            at: 75,
+            edge: SignalEdge::Rising,
+        },
+    );
+    assert!(matches!(
+        false_start.as_slice(),
+        [
+            Event::MeasurementCaptured { .. },
+            Event::FalseStartDetected { .. },
+            Event::ConsequenceApplied { .. }
+        ]
+    ));
+
+    let mut running = running(FinishCondition::Laps(10));
+    issue(&mut running, Command::PauseRace { at: 250 });
+    issue(&mut running, Command::ResumeRace { at: 300 });
+    let lap = issue(
+        &mut running,
+        Command::SensorTriggered {
+            lane: 1,
+            at: 320,
+            edge: SignalEdge::Rising,
+        },
+    );
+    assert!(matches!(
+        lap.last(),
+        Some(Event::ValidLap {
+            lap_time_ms: 220,
+            ..
+        })
+    ));
+    assert!(matches!(
+        RaceEngine::replay(&running).unwrap().state().status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Restarting {
+                paused_at: 250,
+                restart_due_at: 350,
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
 fn restart_sequence_resumes_suspended_phase_and_shifts_time_limit() {
     let mut events = running(FinishCondition::TimeMs(1_000));
     issue(&mut events, Command::PauseRace { at: 400 });
@@ -136,12 +196,14 @@ fn restart_sequence_resumes_suspended_phase_and_shifts_time_limit() {
     );
     let restarting = RaceEngine::replay(&events).unwrap();
     assert!(matches!(
-        restarting.state().phase,
-        RacePhase::Restarting {
-            paused_at: 400,
-            restart_due_at: 950,
+        restarting.state().status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Restarting {
+                paused_at: 400,
+                restart_due_at: 950,
+            },
             ..
-        }
+        })
     ));
     assert_eq!(restarting.state().intended_lane_power(1), Some(false));
 
@@ -151,8 +213,13 @@ fn restart_sequence_resumes_suspended_phase_and_shifts_time_limit() {
     );
     let resumed = RaceEngine::replay(&events).unwrap();
     assert!(matches!(
-        resumed.state().phase,
-        RacePhase::Running { paused_ms: 550, .. }
+        resumed.state().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Running { .. },
+            control: RaceControl::Live,
+            accumulated_pause_ms: 550,
+            ..
+        })
     ));
     assert_eq!(resumed.state().race_elapsed_ms(950), Some(300));
     assert_eq!(resumed.state().intended_lane_power(1), Some(true));
@@ -184,16 +251,24 @@ fn resume_sequence_restores_initial_starting_phase() {
     let resumed = issue(&mut events, Command::AdvanceRace { to: 125 });
     assert_eq!(resumed, vec![Event::RaceResumed { at: 125 }]);
     assert!(matches!(
-        RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Starting {
-            start_due_at: 200,
+        RaceEngine::replay(&events).unwrap().state().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting { start_due_at: 200 },
+            control: RaceControl::Live,
             ..
-        }
+        })
     ));
     assert!(matches!(
         issue(&mut events, Command::AdvanceRace { to: 200 }).as_slice(),
         [Event::OfficialStart { at: 200 }]
     ));
+    assert_eq!(
+        RaceEngine::replay(&events)
+            .unwrap()
+            .state()
+            .race_elapsed_ms(300),
+        Some(100)
+    );
 }
 
 #[test]
@@ -201,15 +276,19 @@ fn pause_is_valid_while_finishing() {
     let mut events = running(FinishCondition::TimeMs(100));
     issue(&mut events, Command::AdvanceRace { to: 200 });
     assert!(matches!(
-        RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Finishing { .. }
+        RaceEngine::replay(&events).unwrap().state().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Finishing { .. },
+            ..
+        })
     ));
     issue(&mut events, Command::PauseRace { at: 210 });
+    issue(&mut events, Command::ResumeRace { at: 220 });
     let emitted = issue(
         &mut events,
         Command::SensorTriggered {
             lane: 1,
-            at: 300,
+            at: 250,
             edge: SignalEdge::Rising,
         },
     );
@@ -218,18 +297,22 @@ fn pause_is_valid_while_finishing() {
         [
             Event::MeasurementCaptured { .. },
             Event::ValidLap {
-                lap_time_ms: 200,
+                lap_time_ms: 150,
                 ..
             },
             Event::LaneFinished { lane: 1, .. }
         ]
     ));
     assert!(matches!(
-        RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Paused {
-            suspended: SuspendedPhase::Finishing { .. },
+        RaceEngine::replay(&events).unwrap().state().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Finishing { .. },
+            control: RaceControl::Restarting {
+                paused_at: 210,
+                restart_due_at: 270,
+            },
             ..
-        }
+        })
     ));
 }
 
@@ -279,18 +362,27 @@ fn pause_and_resume_cli_commands_are_durable() {
         "pause",
         serde_json::json!({"race_id": "race", "at": 200}),
     );
-    assert!(matches!(paused.phase, RacePhase::Paused { .. }));
+    assert!(matches!(
+        paused.status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Paused { .. },
+            ..
+        })
+    ));
     let restarting = cli(
         &db,
         "resume",
         serde_json::json!({"race_id": "race", "at": 300}),
     );
     assert!(matches!(
-        restarting.phase,
-        RacePhase::Restarting {
-            restart_due_at: 350,
+        restarting.status,
+        RaceStatus::Active(ActiveRace {
+            control: RaceControl::Restarting {
+                restart_due_at: 350,
+                ..
+            },
             ..
-        }
+        })
     ));
     cli(
         &db,
@@ -298,8 +390,12 @@ fn pause_and_resume_cli_commands_are_durable() {
         serde_json::json!({"race_id": "race", "to": 350}),
     );
     assert!(matches!(
-        SqliteStore::open(&db).unwrap().load("race").unwrap().phase,
-        RacePhase::Running { paused_ms: 150, .. }
+        SqliteStore::open(&db).unwrap().load("race").unwrap().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Running { .. },
+            accumulated_pause_ms: 150,
+            ..
+        })
     ));
 }
 
