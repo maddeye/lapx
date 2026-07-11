@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 19 — Public read-only binding</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 19 — Public read-only binding</h1>
+<div class="meta"><span class="tag p1">P1</span><span class="tag">Delivery #19</span><span class="tag">Safe deployment</span><p>Use route separation and socket binding instead of authentication.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Split the router assembled in Slices 10–12 into local and public constructors: local has all routes; public has state, SSE, and static display only.</li><li>Bind local controls to loopback and public display to configured LAN address.</li><li>Test absence of mutating routes on the public router.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test public_api_is_read_only</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Remote administration</li><li>Accounts, tokens, or TLS termination</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

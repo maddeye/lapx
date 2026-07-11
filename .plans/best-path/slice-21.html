@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 21 — Local Rennleiter UI</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 21 — Local Rennleiter UI</h1>
+<div class="meta"><span class="tag p2">P2</span><span class="tag">Delivery #21</span><span class="tag">Safe deployment</span><p>Promote proven debug controls into the static app without changing server commands.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Add a control route reusing the Rennscreen state model and serve that route only from the local router.</li><li>Post start, pause, resume, chaos, sensor simulation, and correction to existing endpoints.</li><li>Keep Debug-Bedienung available for hardware diagnosis until this covers the same flow.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>UI smoke test</li><li>Manual complete-race walkthrough from local control route</li><li>The public bind returns 404 for /control and all mutating routes</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Multi-user control</li><li>Undo/redo</li><li>New backend rules</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> Delivery #20 provides the SvelteKit app and shared Rennscreen state model.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

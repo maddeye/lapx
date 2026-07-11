@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 11 — Local HTTP command tracer</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 11 — Local HTTP command tracer</h1>
+<div class="meta"><span class="tag p0">P0</span><span class="tag">Delivery #11</span><span class="tag">Local integration</span><p>Translate HTTP payloads into the same commands used by lapxctl.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Add explicit POST routes for existing commands; handlers deserialize then call EventStore::apply.</li><li>Return domain validation as 400, retryable SQLite busy as 503, and unexpected storage failure as 500; do not duplicate command rules.</li><li>Return committed projected state to make manual calls self-checking.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test http_command_round_trip</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Command bus</li><li>WebSockets</li><li>Idempotency framework</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

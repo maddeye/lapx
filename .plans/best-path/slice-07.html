@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 7 — Chaosauslösung</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 7 — Chaosauslösung</h1>
+<div class="meta"><span class="tag p1">P1</span><span class="tag">Delivery #9</span><span class="tag">Race completeness</span><p>Compose existing pause and consequence behavior; do not create a parallel chaos state machine.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>TriggerChaos validates race-control versus lane source.</li><li>Always emit the pause path; only lane sources apply their configured consequence.</li><li>AdvanceRace restores temporary power-off penalties at expiry.</li><li>Add chaos to lapxctl through the existing command/store path.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test chaos lane_power_off_expiry</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Physical buttons</li><li>New penalty hierarchy</li><li>Penalty for race-control Chaostaster</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><p>No credible implementation PR was found. This plan is derived from LapX domain decisions and standard platform capabilities; unrelated PRs are intentionally omitted.</p><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> Delivery #7 provides consequences and Delivery #8 provides Rennpause; both pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>

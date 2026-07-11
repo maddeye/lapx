@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slice 22 — Fahrer CRUD</title><link rel="stylesheet" href="plan.css"></head><body><main>
+<p class="crumb"><a href="index.html">← Prioritized plan index</a> · <a href="../implementation-plan.html">Original local plan</a></p>
+<h1>Slice 22 — Fahrer CRUD</h1>
+<div class="meta"><span class="tag p2">P2</span><span class="tag">Delivery #22</span><span class="tag">Optional administration</span><p>Add the minimum stable identity needed by later race history and tournaments.</p></div>
+<section class="card"><h2>Best path forward</h2><ol><li>Create drivers(id, display_name, archived_at) with a unique active display-name rule only if required.</li><li>Provide list, create, rename, and archive through local routes.</li><li>Use one simple list/form UI; archived drivers remain valid historical references.</li></ol></section>
+<section class="card"><h2>Verification</h2><ul><li>cargo test driver_crud_round_trip</li></ul></section>
+<section class="card notice"><h2>Keep it simple: not in this slice</h2><ul><li>Profiles, photos, teams</li><li>Pagination or search</li><li>Hard delete</li></ul></section>
+<section class="card"><h2>Inspiration PRs</h2><ul><li><a href="https://github.com/Iamashwin007/YatraGo/pull/2">YatraGo driver CRUD</a></li><li><a href="https://github.com/allejo/bzion/pull/80">Bzion player list redesign</a></li></ul><p class="small">Links are implementation references, not requirements. LapX keeps only the smallest pattern that fits its domain and ADRs.</p></section>
+<section class="card"><h2>Ready / done</h2><ul><li><b>Ready:</b> all lower delivery numbers named by this slice exist and pass.</li><li><b>Done:</b> verification above passes, behavior is reachable through the current tracer surface, and no non-goal leaked into the diff.</li></ul></section>
+</main></body></html>
