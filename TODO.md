@@ -81,21 +81,24 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Raspberry Pi hardware
 
-- [ ] **Delivery 15 — [TimingSource and PowerOutput seams](.plans/best-path/slice-15.html)**
+- [x] **Delivery 15 — [TimingSource and PowerOutput seams](.plans/best-path/slice-15.html)**
   - Route simulated timing, HTTP, and due events through `RaceRuntime`; synchronize power only after commits.
   - Verify: `cargo test simulation_timing_source_triggers_lap`.
 
 - [ ] **Delivery 16 — [GPIO Messereignisse](.plans/best-path/slice-16.html)**
   - Capture configured Raspberry Pi input edges with `rppal`, timestamp first, then enqueue commands.
   - Verify: `cargo test --features gpio` and Pi checks for lane mapping and ≤1 ms timestamp resolution.
+  - Software/feature checks pass; physical Raspberry Pi timing and lane mapping remain pending.
 
 - [ ] **Delivery 17 — [Relay lane power](.plans/best-path/slice-17.html)**
   - Add configured relay outputs, fail-safe startup off, and operator-required resume after recovery.
   - Verify: `cargo test relay_power_follows_race_state startup_all_lanes_off recovered_race_requires_resume` and meter checks on the Pi.
+  - Software fail-safe checks pass; physical relay polarity and all-off meter checks remain pending.
 
 - [ ] **Delivery 18 — [Hardware debug page](.plans/best-path/slice-18.html)**
   - Add a local-only snapshot of configured pins, levels, outputs, and latest raw edges.
   - Verify: `cargo test hardware_page_loads_snapshot` and confirm Pi lane/pin mapping.
+  - Snapshot/page checks pass; confirmation against live Pi pins remains pending.
 
 ## Safe production UI
 
