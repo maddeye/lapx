@@ -1,12 +1,28 @@
 use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
+    ops::Deref,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const EVENT_SCHEMA_VERSION: i64 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub sequence: u64,
+    pub state: RaceState,
+}
+
+impl Deref for StateSnapshot {
+    type Target = RaceState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
@@ -27,6 +43,15 @@ impl fmt::Display for StoreError {
     }
 }
 impl std::error::Error for StoreError {}
+impl StoreError {
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    }
+}
 impl From<rusqlite::Error> for StoreError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
@@ -71,12 +96,31 @@ impl SqliteStore {
         Ok(store)
     }
 
-    pub fn execute(&self, race_id: &str, command: Command) -> Result<RaceState, StoreError> {
+    pub fn execute(&self, race_id: &str, command: Command) -> Result<StateSnapshot, StoreError> {
+        self.execute_with(race_id, |_| command)
+    }
+
+    pub fn execute_now<F>(
+        &self,
+        race_id: &str,
+        proposed_at: u64,
+        command: F,
+    ) -> Result<StateSnapshot, StoreError>
+    where
+        F: FnOnce(u64) -> Command,
+    {
+        self.execute_with(race_id, |last| command(proposed_at.max(last.unwrap_or(0))))
+    }
+
+    fn execute_with<F>(&self, race_id: &str, command: F) -> Result<StateSnapshot, StoreError>
+    where
+        F: FnOnce(Option<u64>) -> Command,
+    {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut events = load_events(&transaction, race_id)?;
-        let engine = RaceEngine::replay(&events)?;
-        let emitted = engine.handle(command)?;
+        let engine = replay(&events)?;
+        let emitted = engine.handle(command(engine.state().last_event_at))?;
         let first_sequence = events.len() as i64 + 1;
         for (offset, event) in emitted.iter().enumerate() {
             transaction.execute(
@@ -85,15 +129,21 @@ impl SqliteStore {
             )?;
         }
         events.extend(emitted);
-        let state = RaceEngine::replay(&events)?.state().clone();
+        let snapshot = StateSnapshot {
+            sequence: events.len() as u64,
+            state: replay(&events)?.state().clone(),
+        };
         transaction.commit()?;
-        Ok(state)
+        Ok(snapshot)
     }
 
-    pub fn load(&self, race_id: &str) -> Result<RaceState, StoreError> {
+    pub fn load(&self, race_id: &str) -> Result<StateSnapshot, StoreError> {
         let connection = self.connect()?;
         let events = load_events(&connection, race_id)?;
-        Ok(RaceEngine::replay(&events)?.state().clone())
+        Ok(StateSnapshot {
+            sequence: events.len() as u64,
+            state: replay(&events)?.state().clone(),
+        })
     }
 
     pub fn events(&self, race_id: &str) -> Result<Vec<Event>, StoreError> {
@@ -103,10 +153,15 @@ impl SqliteStore {
 
     fn connect(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(Duration::from_millis(50))?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
+}
+
+fn replay(events: &[Event]) -> Result<RaceEngine, StoreError> {
+    RaceEngine::replay(events)
+        .map_err(|error| StoreError::CorruptProtocol(format!("invalid event history: {error:?}")))
 }
 
 fn load_events(connection: &Connection, race_id: &str) -> Result<Vec<Event>, StoreError> {

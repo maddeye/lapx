@@ -72,13 +72,13 @@ fn run() -> Result<(), String> {
     };
     let (race_id, command) = parse_command(&args[0], &json)?;
     let database = env::var_os("LAPX_DB").unwrap_or_else(|| "lapx.db".into());
-    let state = SqliteStore::open(database)
+    let snapshot = SqliteStore::open(database)
         .map_err(|error| error.to_string())?
         .execute(&race_id, command)
         .map_err(|error| error.to_string())?;
     println!(
         "{}",
-        serde_json::to_string(&state).map_err(|error| error.to_string())?
+        serde_json::to_string(&snapshot.state).map_err(|error| error.to_string())?
     );
     Ok(())
 }

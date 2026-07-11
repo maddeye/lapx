@@ -34,6 +34,10 @@ impl Due {
     }
 }
 
+pub(crate) fn next_due_at(state: &RaceState) -> Result<Option<ProtocolMillis>, DomainError> {
+    Ok(earliest(state, ProtocolMillis::MAX)?.map(|due| due.key().0))
+}
+
 pub(crate) fn earliest(
     state: &RaceState,
     through: ProtocolMillis,
