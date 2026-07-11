@@ -47,6 +47,7 @@ async fn http_command_round_trip() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     );
     assert_eq!(
@@ -108,6 +109,7 @@ async fn http_command_errors_have_explicit_statuses() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     );
     let malformed = app
@@ -143,8 +145,11 @@ async fn http_command_errors_have_explicit_statuses() {
 async fn http_storage_error_statuses() {
     let corrupt_dir = tempdir().unwrap();
     let corrupt_path = corrupt_dir.path().join("lapx.db");
-    let corrupt_app =
-        router(RaceRuntime::new(SqliteStore::open(&corrupt_path).unwrap(), "race").unwrap());
+    let corrupt_app = router(
+        RaceRuntime::new(SqliteStore::open(&corrupt_path).unwrap(), "race")
+            .await
+            .unwrap(),
+    );
     Connection::open(&corrupt_path)
         .unwrap()
         .execute(
@@ -160,8 +165,11 @@ async fn http_storage_error_statuses() {
 
     let busy_dir = tempdir().unwrap();
     let busy_path = busy_dir.path().join("lapx.db");
-    let busy_app =
-        router(RaceRuntime::new(SqliteStore::open(&busy_path).unwrap(), "race").unwrap());
+    let busy_app = router(
+        RaceRuntime::new(SqliteStore::open(&busy_path).unwrap(), "race")
+            .await
+            .unwrap(),
+    );
     let lock = Connection::open(&busy_path).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     let response = post(

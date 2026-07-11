@@ -134,7 +134,7 @@ impl SqliteStore {
 
     fn connect(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(Duration::from_millis(50))?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }

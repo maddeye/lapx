@@ -67,6 +67,7 @@ async fn sse_emits_state_after_command() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     );
     let response = app
@@ -98,6 +99,7 @@ async fn sse_connection_race_never_loses_a_commit() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     );
     let connect = app.clone().oneshot(
@@ -125,6 +127,7 @@ async fn sse_lag_reloads_the_full_current_state() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     );
     let response = app

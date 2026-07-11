@@ -14,6 +14,7 @@ async fn debug_page_loads_and_references_every_control() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     )
     .oneshot(Request::get("/debug").body(Body::empty()).unwrap())

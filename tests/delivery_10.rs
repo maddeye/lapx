@@ -32,6 +32,7 @@ async fn http_state_returns_json() {
         SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
         "race",
     )
+    .await
     .unwrap();
     let response = router(runtime)
         .oneshot(Request::get("/api/state").body(Body::empty()).unwrap())
@@ -48,7 +49,9 @@ async fn http_state_returns_json() {
 async fn runtime_materializes_due_event() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    let runtime = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race").unwrap();
+    let runtime = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race")
+        .await
+        .unwrap();
     let mut updates = runtime.subscribe();
     let app = router(runtime.clone());
     let response = app
@@ -88,7 +91,9 @@ async fn runtime_materializes_due_event() {
 async fn runtime_clock_does_not_advance_during_downtime() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    let runtime = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race").unwrap();
+    let runtime = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race")
+        .await
+        .unwrap();
     let response = router(runtime.clone())
         .oneshot(
             Request::post("/api/start")
@@ -104,7 +109,9 @@ async fn runtime_clock_does_not_advance_during_downtime() {
     drop(runtime);
 
     tokio::time::advance(Duration::from_secs(60)).await;
-    let restarted = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race").unwrap();
+    let restarted = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race")
+        .await
+        .unwrap();
     let mut updates = restarted.subscribe();
     tokio::time::advance(Duration::from_millis(99)).await;
     tokio::task::yield_now().await;

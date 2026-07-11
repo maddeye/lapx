@@ -70,7 +70,12 @@
   <script>
     const byId = id => document.getElementById(id);
     const number = id => Number(byId(id).value);
-    const show = snapshot => byId('state').textContent = JSON.stringify(snapshot, null, 2);
+    let sequence = -1;
+    const show = snapshot => {
+      if (snapshot.sequence <= sequence) return;
+      sequence = snapshot.sequence;
+      byId('state').textContent = JSON.stringify(snapshot, null, 2);
+    };
     const consequence = prefix => {
       const kind = byId(prefix + '_consequence').value;
       return kind === 'abort' ? 'abort' : { [kind]: number(prefix + '_value') };

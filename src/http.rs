@@ -177,18 +177,11 @@ async fn debug() -> Html<&'static str> {
 enum HttpError {
     Malformed(String),
     Runtime(RuntimeError),
-    Store(StoreError),
 }
 
 impl From<RuntimeError> for HttpError {
     fn from(value: RuntimeError) -> Self {
         Self::Runtime(value)
-    }
-}
-
-impl From<StoreError> for HttpError {
-    fn from(value: StoreError) -> Self {
-        Self::Store(value)
     }
 }
 
@@ -198,7 +191,7 @@ impl IntoResponse for HttpError {
             Self::Malformed(_) | Self::Runtime(RuntimeError::Store(StoreError::Domain(_))) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Runtime(RuntimeError::Store(error)) | Self::Store(error) if error.is_busy() => {
+            Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,

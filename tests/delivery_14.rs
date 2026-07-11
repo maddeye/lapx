@@ -3,11 +3,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use lapx::{
-    domain::{Consequence, FinishCondition, FinishMode, RaceConfig, RaceStatus},
+    domain::{
+        Command, Consequence, FinishCondition, FinishMode, Lifecycle, RaceConfig, RaceStatus,
+    },
     http::router,
     runtime::{RaceRuntime, StateSnapshot},
     store::SqliteStore,
 };
+use rusqlite::Connection;
 use std::time::Duration;
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -43,7 +46,11 @@ async fn post(app: axum::Router, path: &str, body: serde_json::Value) -> StateSn
 async fn http_correction_updates_finished_race_and_reopened_store() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    let app = router(RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race").unwrap());
+    let app = router(
+        RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race")
+            .await
+            .unwrap(),
+    );
     let started = post(
         app.clone(),
         "/api/start",
@@ -82,6 +89,7 @@ async fn debug_page_exposes_every_race_config_value() {
             SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
             "race",
         )
+        .await
         .unwrap(),
     )
     .oneshot(Request::get("/debug").body(Body::empty()).unwrap())
@@ -119,4 +127,95 @@ async fn debug_page_exposes_every_race_config_value() {
     ] {
         assert!(page.contains(value), "missing {value}");
     }
+    assert!(page.contains("snapshot.sequence <= sequence"));
+    assert!(page.contains("sequence = snapshot.sequence"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_store_commit_is_published_and_started_automatically() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lapx.db");
+    let store = SqliteStore::open(&path).unwrap();
+    let runtime = RaceRuntime::new(store.clone(), "race").await.unwrap();
+    let mut updates = runtime.subscribe();
+    tokio::task::yield_now().await;
+    runtime.snapshot().await.unwrap();
+
+    let committed = tokio::task::spawn_blocking(move || {
+        store.execute(
+            "race",
+            Command::StartRace {
+                config: config(),
+                at: 0,
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let mut seen_external = false;
+    loop {
+        let snapshot = updates.recv().await.unwrap();
+        seen_external |= snapshot.sequence == committed.sequence;
+        if matches!(
+            snapshot.state.status,
+            RaceStatus::Active(lapx::domain::ActiveRace {
+                lifecycle: Lifecycle::Running { .. },
+                ..
+            })
+        ) {
+            assert!(seen_external);
+            assert!(snapshot.sequence > committed.sequence);
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_worker_recovers_after_sqlite_write_lock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lapx.db");
+    let runtime = RaceRuntime::new(SqliteStore::open(&path).unwrap(), "race")
+        .await
+        .unwrap();
+    let mut updates = runtime.subscribe();
+    runtime
+        .apply(Command::StartRace {
+            config: config(),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    updates.recv().await.unwrap();
+
+    let lock = Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    lock.execute_batch("COMMIT").unwrap();
+
+    let recovered = tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            let snapshot = updates.recv().await.unwrap();
+            if matches!(
+                snapshot.state.status,
+                RaceStatus::Active(lapx::domain::ActiveRace {
+                    lifecycle: Lifecycle::Running { .. },
+                    ..
+                })
+            ) {
+                break snapshot;
+            }
+        }
+    })
+    .await
+    .expect("due worker permanently exited after a transient SQLite lock");
+    assert!(recovered.sequence > 1);
 }
