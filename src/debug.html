@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LapX Debug-Bedienung</title>
+  <style>
+    body { font: 16px system-ui; max-width: 70rem; margin: auto; padding: 1rem; }
+    fieldset { margin-block: 1rem; }
+    label, button { margin: .25rem; }
+    input, select { display: block; }
+    button { min-height: 2.5rem; }
+    pre { white-space: pre-wrap; background: #eee; padding: 1rem; }
+    #errors { color: #a00; }
+  </style>
+</head>
+<body>
+  <h1>LapX Debug-Bedienung</h1>
+  <fieldset>
+    <legend>RaceConfig</legend>
+    <label>lanes<input id="lanes" type="number" value="4"></label>
+    <label>start_sequence_ms<input id="start_sequence_ms" type="number" value="3000"></label>
+    <label>restart_sequence_ms<input id="restart_sequence_ms" type="number" value="3000"></label>
+    <label>minimum_lap_time_ms<input id="minimum_lap_time_ms" type="number" value="3000"></label>
+    <label>finish_condition
+      <select id="finish_condition"><option value="laps">laps</option><option value="time_ms">time_ms</option></select>
+    </label>
+    <label>finish target<input id="finish_target" type="number" value="10"></label>
+    <label>finish_mode
+      <select id="finish_mode"><option value="immediate">immediate</option><option value="leader_lap">leader_lap</option><option value="all_current_lap">all_current_lap</option></select>
+    </label>
+    <label>false_start_consequence
+      <select id="false_start_consequence"><option value="abort">abort</option><option value="result_time_penalty_ms">result_time_penalty_ms</option><option value="lane_power_off_ms">lane_power_off_ms</option></select>
+    </label>
+    <label>false start consequence value<input id="false_start_value" type="number" value="1000"></label>
+    <label>chaos_consequence
+      <select id="chaos_consequence"><option value="abort">abort</option><option value="result_time_penalty_ms">result_time_penalty_ms</option><option value="lane_power_off_ms">lane_power_off_ms</option></select>
+    </label>
+    <label>chaos consequence value<input id="chaos_value" type="number" value="1000"></label>
+    <button id="start">Start race</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Messstellen</legend>
+    <button class="sensor" data-lane="1">Sensor 1</button>
+    <button class="sensor" data-lane="2">Sensor 2</button>
+    <button class="sensor" data-lane="3">Sensor 3</button>
+    <button class="sensor" data-lane="4">Sensor 4</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Race control</legend>
+    <button data-command="pause">Pause</button>
+    <button data-command="resume">Resume</button>
+    <button id="race-chaos">Race-control chaos</button>
+    <label>Chaos lane<input id="chaos_lane" type="number" value="1"></label>
+    <button id="lane-chaos">Lane chaos</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Rundenkorrektur</legend>
+    <label>lane<input id="correction_lane" type="number" value="1"></label>
+    <label>delta_thousandths<input id="delta_thousandths" type="number" value="0"></label>
+    <button id="correct">Apply correction</button>
+  </fieldset>
+
+  <p id="errors" role="alert"></p>
+  <pre id="state">Connecting…</pre>
+
+  <script>
+    const byId = id => document.getElementById(id);
+    const number = id => Number(byId(id).value);
+    const show = snapshot => byId('state').textContent = JSON.stringify(snapshot, null, 2);
+    const consequence = prefix => {
+      const kind = byId(prefix + '_consequence').value;
+      return kind === 'abort' ? 'abort' : { [kind]: number(prefix + '_value') };
+    };
+    async function send(path, body) {
+      byId('errors').textContent = '';
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(text);
+      const snapshot = JSON.parse(text);
+      show(snapshot);
+      return snapshot;
+    }
+    const report = action => action().catch(error => byId('errors').textContent = error.message);
+
+    byId('start').onclick = () => report(() => {
+      const finishKind = byId('finish_condition').value;
+      return send('/api/start', { config: {
+        lanes: number('lanes'),
+        start_sequence_ms: number('start_sequence_ms'),
+        restart_sequence_ms: number('restart_sequence_ms'),
+        minimum_lap_time_ms: number('minimum_lap_time_ms'),
+        finish_condition: { [finishKind]: number('finish_target') },
+        finish_mode: byId('finish_mode').value,
+        false_start_consequence: consequence('false_start'),
+        chaos_consequence: consequence('chaos')
+      }});
+    });
+    document.querySelectorAll('.sensor').forEach(button => button.onclick = () =>
+      report(() => send('/api/sensor', { lane: Number(button.dataset.lane), edge: 'rising' })));
+    const commandPaths = { pause: '/api/pause', resume: '/api/resume' };
+    document.querySelectorAll('[data-command]').forEach(button => button.onclick = () =>
+      report(() => send(commandPaths[button.dataset.command])));
+    byId('race-chaos').onclick = () => report(() => send('/api/chaos', { source: 'race_control' }));
+    byId('lane-chaos').onclick = () => report(() => send('/api/chaos', { source: { lane: number('chaos_lane') } }));
+    byId('correct').onclick = () => report(() => send('/api/correct-laps', {
+      lane: number('correction_lane'), delta_thousandths: number('delta_thousandths')
+    }));
+
+    const events = new EventSource('/api/state/stream');
+    events.addEventListener('state', event => show(JSON.parse(event.data)));
+    events.onerror = () => byId('errors').textContent = 'State stream disconnected; reconnecting…';
+  </script>
+</body>
+</html>

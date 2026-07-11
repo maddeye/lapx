@@ -1,4 +1,4 @@
-use super::{ProtocolMillis, RaceConfig};
+use super::{DomainError, ProtocolMillis, RaceConfig, scheduler};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +114,10 @@ pub struct RaceState {
 impl RaceState {
     pub fn lane(&self, lane: u8) -> Option<&LaneState> {
         self.lanes.iter().find(|item| item.lane == lane)
+    }
+
+    pub fn next_due_at(&self) -> Result<Option<ProtocolMillis>, DomainError> {
+        scheduler::next_due_at(self)
     }
 
     pub fn config(&self) -> Option<&RaceConfig> {
