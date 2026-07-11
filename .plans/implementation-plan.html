@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Implementation Plan — LapX</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {
+    --nord0:#2E3440; --nord1:#3B4252; --nord2:#434C5E; --nord3:#4C566A;
+    --nord4:#D8DEE9; --nord6:#ECEFF4; --nord7:#8FBCBB; --nord8:#88C0D0;
+    --nord9:#81A1C1; --nord10:#5E81AC; --nord13:#EBCB8B; --nord14:#A3BE8C; --nord15:#B48EAD;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin:0; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--nord0); color:var(--nord4); line-height:1.6; display:grid; grid-template-columns:280px 1fr; min-height:100vh; }
+  aside { background:var(--nord1); border-right:1px solid var(--nord2); padding:1.25rem; position:sticky; top:0; height:100vh; overflow-y:auto; }
+  aside h2 { color:var(--nord8); font-size:.75rem; letter-spacing:.1em; text-transform:uppercase; margin:1.2rem 0 .4rem; }
+  aside h2:first-child { margin-top:0; }
+  aside a { display:flex; align-items:center; gap:.5rem; color:var(--nord4); text-decoration:none; padding:.25rem .45rem; border-radius:4px; font-size:.86rem; }
+  aside a::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--nord3); flex-shrink:0; }
+  aside a[data-status="todo"]::before { background:var(--nord9); }
+  aside a[data-status="doing"]::before { background:var(--nord13); }
+  aside a[data-status="done"]::before { background:var(--nord14); }
+  aside a[data-status="done"] { color:var(--nord3); text-decoration:line-through; }
+  aside a:hover { background:var(--nord2); color:var(--nord6); }
+  main { padding:2.2rem 3rem; max-width:980px; }
+  h1 { color:var(--nord6); margin:0 0 .3rem; font-size:2rem; }
+  .lede { color:var(--nord4); opacity:.86; margin:0 0 1rem; max-width:72ch; }
+  h2.section { color:var(--nord8); border-bottom:1px solid var(--nord2); padding-bottom:.35rem; margin-top:2.5rem; }
+  .note { background:rgba(136,192,208,.08); border-left:3px solid var(--nord8); padding:.7rem .9rem; border-radius:4px; margin:1rem 0; }
+  .slice { border:1px solid var(--nord2); border-radius:8px; padding:1rem 1.2rem; margin-bottom:1rem; background:var(--nord1); scroll-margin-top:1rem; border-left:4px solid var(--nord3); }
+  .slice[data-status="todo"] { border-left-color:var(--nord9); }
+  .slice[data-status="doing"] { border-left-color:var(--nord13); }
+  .slice[data-status="done"] { border-left-color:var(--nord14); opacity:.62; }
+  .slice[data-status="done"] h3 { text-decoration:line-through; }
+  .slice-head { display:flex; align-items:center; gap:.75rem; margin-bottom:.25rem; }
+  .slice-head h3 { margin:0; font-size:1.08rem; color:var(--nord6); flex:1; }
+  .slice-head input { width:1rem; height:1rem; accent-color:var(--nord14); }
+  .status { font-size:.68rem; text-transform:uppercase; letter-spacing:.06em; padding:.12rem .48rem; border-radius:999px; font-weight:700; background:var(--nord2); color:var(--nord4); }
+  .slice[data-status="todo"] .status { background:rgba(129,161,193,.2); color:var(--nord9); }
+  .slice[data-status="doing"] .status { background:rgba(235,203,139,.2); color:var(--nord13); }
+  .slice[data-status="done"] .status { background:rgba(163,190,140,.25); color:var(--nord14); }
+  .sub { color:var(--nord4); opacity:.8; font-size:.9rem; margin:.1rem 0 .65rem; }
+  .layers { margin:.5rem 0 0; padding:0; list-style:none; border-left:2px solid var(--nord2); padding-left:1rem; }
+  .layers li { padding:.16rem 0; }
+  .layers li b { color:var(--nord10); font-weight:700; margin-right:.35rem; }
+  .layers li.db b { color:var(--nord15); }
+  .layers li.api b { color:var(--nord9); }
+  .layers li.ui b { color:var(--nord14); }
+  .layers li.test b { color:var(--nord13); }
+  .verify { margin-top:.65rem; padding:.48rem .75rem; background:rgba(163,190,140,.08); border-left:3px solid var(--nord14); border-radius:4px; font-size:.9rem; }
+  .verify b { color:var(--nord14); }
+  .decisions { background:var(--nord1); border-radius:8px; padding:1rem 1.3rem; border-top:3px solid var(--nord15); }
+  .decision { padding:.7rem 0; border-bottom:1px dashed var(--nord2); }
+  .decision:last-child { border-bottom:none; }
+  .decision h4 { margin:0 0 .25rem; color:var(--nord13); }
+  .decision p { margin:.18rem 0; }
+  .decision .meta { font-size:.84rem; color:var(--nord4); opacity:.78; }
+  code { background:var(--nord2); padding:.08rem .3rem; border-radius:3px; color:var(--nord7); font-size:.9em; }
+  @media (max-width:780px) { body{grid-template-columns:1fr;} aside{position:static;height:auto;} main{padding:1.5rem;} }
+</style>
+</head>
+<body>
+<!--
+  Agent schema:
+    <section class="slice" id="slice-N" data-status="todo|doing|done" data-layers="domain db api ui test">
+    <article class="decision" id="decision-N">
+  Sidebar <a data-status="…"> mirrors each slice status.
+-->
+<aside>
+  <h2>Foundation</h2>
+  <a href="#slice-1" data-status="todo">1 · Config shell</a>
+  <a href="#slice-2" data-status="todo">2 · Start + replay</a>
+  <a href="#slice-3" data-status="todo">3 · Official start</a>
+  <a href="#slice-4" data-status="todo">4 · Laps + min time</a>
+  <a href="#slice-5" data-status="todo">5 · Fehlstart</a>
+  <a href="#slice-6" data-status="todo">6 · Pause/resume</a>
+  <a href="#slice-7" data-status="todo">7 · Chaos</a>
+  <a href="#slice-8" data-status="todo">8 · Finish rules</a>
+  <a href="#slice-9" data-status="todo">9 · SQLite + CLI</a>
+  <h2>Next thin slices</h2>
+  <a href="#slice-10" data-status="todo">10 · Local HTTP state</a>
+  <a href="#slice-11" data-status="todo">11 · Local HTTP commands</a>
+  <a href="#slice-12" data-status="todo">12 · SSE state</a>
+  <a href="#slice-13" data-status="todo">13 · Debug page</a>
+  <a href="#slice-14" data-status="todo">14 · Config on debug page</a>
+  <a href="#slice-15" data-status="todo">15 · Timing seam</a>
+  <a href="#slice-16" data-status="todo">16 · GPIO Messereignisse</a>
+  <a href="#slice-17" data-status="todo">17 · Relay power</a>
+  <a href="#slice-18" data-status="todo">18 · Hardware debug page</a>
+  <a href="#slice-19" data-status="todo">19 · Public read-only port</a>
+  <a href="#slice-20" data-status="todo">20 · Rennscreen shell</a>
+  <a href="#slice-21" data-status="todo">21 · Rennleiter UI</a>
+  <a href="#slice-22" data-status="todo">22 · Drivers</a>
+  <a href="#slice-23" data-status="todo">23 · Race history stats</a>
+  <a href="#slice-24" data-status="todo">24 · Elo</a>
+  <a href="#slice-25" data-status="todo">25 · Manual tournament</a>
+  <a href="#slice-26" data-status="todo">26 · Generated tournament</a>
+  <h2>Reference</h2>
+  <a href="#reevaluation">Reevaluation</a>
+  <a href="#decisions">Design decisions</a>
+  <a href="#ticket-notes">Ticket notes</a>
+</aside>
+<main>
+  <h1>Implementation Plan — LapX</h1>
+  <p class="lede">LapX is a local Carrera timing and race-control system for 1–4 lanes. The old plan put most RaceEngine, storage, CLI, HTTP, and UI work into one huge slice. This reevaluation keeps completed core work visible and breaks the remaining work into narrow, independently verifiable tracer bullets.</p>
+
+  <h2 class="section" id="reevaluation">Reevaluation</h2>
+  <div class="note">
+    <b>Cut made:</b> the original Slice 1 was too large. HTTP, SSE, debug UI, GPIO, production UI, and Verwaltung are now separate slices. Each todo slice has one demo path and one smallest useful test. Before HTTP exists, <code>lapxctl</code> is the checkable control surface.
+  </div>
+
+  <h2 class="section">Vertical Slices</h2>
+
+  <section class="slice" id="slice-1" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 1 — Race configuration shell</h3><span class="status">todo</span></div>
+    <p class="sub">Define the smallest RaceEngine boundary: config, commands, events, state, and validation for 1–4 lanes.</p>
+    <ul class="layers">
+      <li><b>Domain</b> <code>RaceConfig</code>, penalties, Zielbedingung, Zielmodus, commands/events/state.</li>
+      <li class="api"><b>API</b> <code>RaceEngine::handle_all</code> rejects impossible initial commands and invalid config.</li>
+      <li class="test"><b>Test</b> invalid config/control-command tests.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test invalid_start_config invalid_control_commands</code></div>
+  </section>
+
+  <section class="slice" id="slice-2" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 2 — Start race and replay projection</h3><span class="status">todo</span></div>
+    <p class="sub">Start a race, append configured/start-sequence events, and rebuild the same state from committed events.</p>
+    <ul class="layers">
+      <li><b>Domain</b> append-only Rennprotokoll events become the sole source of RaceState.</li>
+      <li class="api"><b>API</b> <code>StartRace</code>, <code>replay</code>, <code>replay_at</code>.</li>
+      <li class="test"><b>Test</b> replay determinism and corrupt-protocol rejection.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test replay</code></div>
+  </section>
+
+  <section class="slice" id="slice-3" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 3 — Official start as due event</h3><span class="status">todo</span></div>
+    <p class="sub">Make the Startsequenz visible, then commit <code>OfficialStart</code> only when a live command or advance reaches the due time.</p>
+    <ul class="layers">
+      <li><b>Domain</b> race stays <code>Starting</code> until the official start event exists.</li>
+      <li class="api"><b>API</b> <code>AdvanceRace</code> materializes due events chronologically.</li>
+      <li class="test"><b>Test</b> start sequence visibility, race-time projection, old timestamp rejection.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test start_sequence replay_at commands_before_last</code></div>
+  </section>
+
+  <section class="slice" id="slice-4" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 4 — Messereignis to gültige Runde</h3><span class="status">todo</span></div>
+    <p class="sub">Capture lane measurements and accept a lap only after the lane's Mindestrundenzeit.</p>
+    <ul class="layers">
+      <li><b>Domain</b> <code>MeasurementCaptured</code>, <code>ValidLapAccepted</code>, rejection reasons, lap/best-lap state.</li>
+      <li class="api"><b>API</b> <code>SensorTriggered</code> uses authoritative timestamps.</li>
+      <li class="test"><b>Test</b> below-minimum lap is rejected while valid lap updates state.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test mindestrundenzeit</code></div>
+  </section>
+
+  <section class="slice" id="slice-5" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 5 — Fehlstart consequences</h3><span class="status">todo</span></div>
+    <p class="sub">Treat a Messereignis before official initial start as a Fehlstart and apply the configured consequence.</p>
+    <ul class="layers">
+      <li><b>Domain</b> time penalty, lane power-off, and abort consequences.</li>
+      <li class="api"><b>API</b> same <code>SensorTriggered</code> path emits Fehlstart events.</li>
+      <li class="test"><b>Test</b> lane power-off consequence and abort consequence.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test false_start messereignis_during_startsequence</code></div>
+  </section>
+
+  <section class="slice" id="slice-6" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 6 — Rennpause and Wiederanlaufsequenz</h3><span class="status">todo</span></div>
+    <p class="sub">Pause stops race time and lane power, rolling laps still count, and resume schedules a new Startsequenz.</p>
+    <ul class="layers">
+      <li><b>Domain</b> <code>RacePauseStarted</code> and <code>RestartSequencePlanned</code>.</li>
+      <li class="api"><b>API</b> <code>PauseRace</code>, <code>ResumeRace</code>, <code>AdvanceRace</code>.</li>
+      <li class="test"><b>Test</b> paused clock, rolling lap, resume sequence, official resume.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test rennpause restart_sequence resume_sequence</code></div>
+  </section>
+
+  <section class="slice" id="slice-7" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 7 — Chaostaster path</h3><span class="status">todo</span></div>
+    <p class="sub">Chaos pauses the race; lane buttons apply configured consequences and race-control stays penalty-free.</p>
+    <ul class="layers">
+      <li><b>Domain</b> <code>ChaosTriggered</code>, <code>PenaltyApplied</code>, power-off expiry.</li>
+      <li class="api"><b>API</b> <code>TriggerChaos</code> validates lane buttons.</li>
+      <li class="test"><b>Test</b> lane penalty, race-control no penalty, abort, power-off expiry.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test chaos lane_power_off_expiry</code></div>
+  </section>
+
+  <section class="slice" id="slice-8" data-status="todo" data-layers="domain api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 8 — Zielbedingung, Zielmodus, correction</h3><span class="status">todo</span></div>
+    <p class="sub">Finish by lap or time limit, apply immediate/leader/all-current modes, and allow post-race Rundenkorrektur.</p>
+    <ul class="layers">
+      <li><b>Domain</b> <code>FinishConditionReached</code>, <code>RaceFinished</code>, <code>LapCorrectionApplied</code>.</li>
+      <li class="api"><b>API</b> live commands advance due finish events before handling later work.</li>
+      <li class="test"><b>Test</b> immediate, leader lap, all-current lap, time limit, correction constraints.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test finish live_correction sensor_after_due_time</code></div>
+  </section>
+
+  <section class="slice" id="slice-9" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 9 — SQLite Rennprotokoll and lapxctl tracer</h3><span class="status">todo</span></div>
+    <p class="sub">Persist events transactionally, replay committed events, and expose a non-interactive JSON CLI for automation.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> append-only <code>race_events</code>, WAL, <code>synchronous=FULL</code>.</li>
+      <li class="api"><b>API</b> <code>EventStore::apply/load</code> and <code>lapxctl</code> commands.</li>
+      <li class="ui"><b>UI</b> CLI JSON output is the current debug control surface.</li>
+      <li class="test"><b>Test</b> SQLite replay and CLI JSON state tests.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test store_cli sqlite_store_replays_committed_events</code></div>
+  </section>
+
+  <section class="slice" id="slice-10" data-status="todo" data-layers="db api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 10 — Local HTTP state endpoint</h3><span class="status">todo</span></div>
+    <p class="sub">Add the smallest Rust server: local bind, shared EventStore, and read-only current state.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> open the same SQLite path as <code>lapxctl</code>.</li>
+      <li class="api"><b>API</b> <code>GET /api/state</code> returns <code>RaceState</code> JSON projected at request time.</li>
+      <li class="test"><b>Test</b> start with a temp DB and assert empty/default JSON state.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test http_state_returns_json</code></div>
+  </section>
+
+  <section class="slice" id="slice-11" data-status="todo" data-layers="db api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 11 — Local HTTP command tracer</h3><span class="status">todo</span></div>
+    <p class="sub">Expose mutating POST routes by reusing the existing Command/EventStore path, no new command logic.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> command events commit to <code>race_events</code>.</li>
+      <li class="api"><b>API</b> <code>POST /api/start</code>, <code>/sensor</code>, <code>/pause</code>, <code>/resume</code>, <code>/chaos</code>, <code>/correction</code>, <code>/advance</code>, <code>/stop</code>.</li>
+      <li class="test"><b>Test</b> POST start then sensor then GET state shows one lap.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test http_command_round_trip</code></div>
+  </section>
+
+  <section class="slice" id="slice-12" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 12 — SSE state stream</h3><span class="status">todo</span></div>
+    <p class="sub">Push state updates after committed commands; keep commands on HTTP POST.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> <code>GET /api/state/stream</code> emits current state and subsequent committed states.</li>
+      <li class="ui"><b>UI</b> tiny browser/manual subscriber can see updates without refresh.</li>
+      <li class="test"><b>Test</b> open stream, POST command, assert next SSE event contains updated phase/laps.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test sse_emits_state_after_command</code></div>
+  </section>
+
+  <section class="slice" id="slice-13" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 13 — Minimal Debug-Bedienung page</h3><span class="status">todo</span></div>
+    <p class="sub">One static debug page that uses the HTTP/SSE API; no SvelteKit yet and no styling pass.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> serve <code>/debug</code> from Rust.</li>
+      <li class="ui"><b>UI</b> buttons for start, pause, resume, sensor 1–4, chaos 1–4, race-control chaos, and state display.</li>
+      <li class="test"><b>Test</b> smoke GET <code>/debug</code> and assert it references existing endpoints.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test debug_page_loads</code>; open <code>/debug</code> and click start/sensor.</div>
+  </section>
+
+  <section class="slice" id="slice-14" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 14 — Debug page race config and corrections</h3><span class="status">todo</span></div>
+    <p class="sub">Let the debug page cover the command parameters that lapxctl already supports.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> accept lanes, laps/time target, and correction payloads with existing validation.</li>
+      <li class="ui"><b>UI</b> inputs for lanes, target, and post-race Rundenkorrektur.</li>
+      <li class="test"><b>Test</b> browser-free POST correction after finished race updates state.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test http_correction_updates_finished_race</code></div>
+  </section>
+
+  <section class="slice" id="slice-15" data-status="todo" data-layers="domain api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 15 — TimingSource and PowerOutput seams</h3><span class="status">todo</span></div>
+    <p class="sub">Introduce hardware seams without talking to GPIO yet; simulation continues to drive the same command path.</p>
+    <ul class="layers">
+      <li><b>Domain</b> define Messereignis input and lane power output ports outside RaceEngine rules.</li>
+      <li class="api"><b>API</b> simulation adapter converts injected Messereignisse into <code>SensorTriggered</code>.</li>
+      <li class="ui"><b>UI</b> debug page still works unchanged through simulation.</li>
+      <li class="test"><b>Test</b> simulation source triggers a lap without GPIO dependencies.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test simulation_timing_source_triggers_lap</code></div>
+  </section>
+
+  <section class="slice" id="slice-16" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 16 — GPIO Messereignisse on Raspberry Pi</h3><span class="status">todo</span></div>
+    <p class="sub">Map configured BCM input pins to lane Messereignisse with millisecond timestamps.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> GPIO adapter feeds the same <code>SensorTriggered</code> command path.</li>
+      <li class="ui"><b>UI</b> expose latest raw input timestamp in hardware debug output.</li>
+      <li class="test"><b>Test</b> Pi hardware check: trigger lane input and assert a committed Messereignis/lap path.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> on Pi, run hardware check and confirm input-to-event latency is acceptable.</div>
+  </section>
+
+  <section class="slice" id="slice-17" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 17 — Relay lane power control</h3><span class="status">todo</span></div>
+    <p class="sub">Drive relay outputs from RaceState lane power, including safe startup power-off.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> PowerOutput adapter applies lane <code>powered</code> state after commits/projection changes.</li>
+      <li class="ui"><b>UI</b> hardware debug page shows expected powered state per lane.</li>
+      <li class="test"><b>Test</b> fake PowerOutput observes startup off, start on, pause off, lane penalty off/restore.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test relay_power_follows_race_state</code>; Pi relay smoke test.</div>
+  </section>
+
+  <section class="slice" id="slice-18" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 18 — Hardware debug page</h3><span class="status">todo</span></div>
+    <p class="sub">Show raw GPIO inputs, relay outputs, and recognized Messereignisse separate from the race debug page.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> <code>GET /api/hardware</code> returns raw input/output snapshot.</li>
+      <li class="ui"><b>UI</b> <code>/hardware</code> renders GPIO pins, last edge times, and relay states.</li>
+      <li class="test"><b>Test</b> fake hardware snapshot renders all configured pins.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test hardware_page_loads_snapshot</code></div>
+  </section>
+
+  <section class="slice" id="slice-19" data-status="todo" data-layers="api test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 19 — Public read-only binding</h3><span class="status">todo</span></div>
+    <p class="sub">Separate local mutating API from public display API with the smallest routing split.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> local bind serves commands; public bind serves only state/SSE/static display assets.</li>
+      <li class="test"><b>Test</b> public bind rejects POST command routes and still serves state/SSE.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test public_api_is_read_only</code></div>
+  </section>
+
+  <section class="slice" id="slice-20" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 20 — Rennscreen shell</h3><span class="status">todo</span></div>
+    <p class="sub">Add the first SvelteKit-built static public display: lanes, laps, race time, phase.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> consume public state/SSE only.</li>
+      <li class="ui"><b>UI</b> fullscreen read-only Rennscreen with no controls.</li>
+      <li class="test"><b>Test</b> built asset is served by Rust and updates after SSE state.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>npm test</code> for UI unit/smoke; <code>cargo test serves_static_rennscreen</code></div>
+  </section>
+
+  <section class="slice" id="slice-21" data-status="todo" data-layers="api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 21 — Local Rennleiter UI shell</h3><span class="status">todo</span></div>
+    <p class="sub">Promote debug controls into a local race-control UI while still using the same POST endpoints.</p>
+    <ul class="layers">
+      <li class="api"><b>API</b> no new race rules; reuse local command endpoints.</li>
+      <li class="ui"><b>UI</b> local-only start/pause/resume/chaos/sensor/correction controls with clear current state.</li>
+      <li class="test"><b>Test</b> UI command button posts and state view updates.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> UI smoke test plus manual local race-control walkthrough.</div>
+  </section>
+
+  <section class="slice" id="slice-22" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 22 — Fahrer CRUD</h3><span class="status">todo</span></div>
+    <p class="sub">Add only named drivers, enough to attach later races and tournaments.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> <code>drivers</code> table with stable id and display name.</li>
+      <li class="api"><b>API</b> list/create/rename/archive drivers.</li>
+      <li class="ui"><b>UI</b> local Fahrer list and create/rename/archive controls.</li>
+      <li class="test"><b>Test</b> create driver appears in API and UI list.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test driver_crud_round_trip</code></div>
+  </section>
+
+  <section class="slice" id="slice-23" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 23 — Race history statistics</h3><span class="status">todo</span></div>
+    <p class="sub">Persist completed race summaries and derive simple Fahrer statistics from them.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> completed race summary rows linked to drivers/lanes.</li>
+      <li class="api"><b>API</b> list completed races and per-driver starts/wins/best lap.</li>
+      <li class="ui"><b>UI</b> Fahrer detail shows derived stats.</li>
+      <li class="test"><b>Test</b> completed race produces reproducible stats.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test driver_stats_from_completed_race</code></div>
+  </section>
+
+  <section class="slice" id="slice-24" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 24 — Elo after completed races</h3><span class="status">todo</span></div>
+    <p class="sub">Calculate deterministic Elo deltas from completed race ranking; keep it behind completed race summaries.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> store current Elo and per-race Elo changes.</li>
+      <li class="api"><b>API</b> expose driver Elo and race Elo delta.</li>
+      <li class="ui"><b>UI</b> Fahrer list shows Elo.</li>
+      <li class="test"><b>Test</b> fixed race result yields fixed Elo changes.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test elo_is_reproducible</code></div>
+  </section>
+
+  <section class="slice" id="slice-25" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 25 — Manual tournament race list</h3><span class="status">todo</span></div>
+    <p class="sub">Create a tournament manually by assigning drivers to heats; no generator yet.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> tournaments, heats, lane assignments.</li>
+      <li class="api"><b>API</b> create tournament, add heat, assign drivers, mark heat complete from race summary.</li>
+      <li class="ui"><b>UI</b> tournament page with manual heat editor and progress.</li>
+      <li class="test"><b>Test</b> manual tournament advances after a completed heat.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test manual_tournament_flow</code></div>
+  </section>
+
+  <section class="slice" id="slice-26" data-status="todo" data-layers="db api ui test">
+    <div class="slice-head"><input type="checkbox" /><h3>Slice 26 — Random and Elo-based tournament generation</h3><span class="status">todo</span></div>
+    <p class="sub">Generate heat assignments deterministically from a seed, either random or Elo-balanced.</p>
+    <ul class="layers">
+      <li class="db"><b>DB</b> persist generator mode and seed with generated heats.</li>
+      <li class="api"><b>API</b> generate tournament from selected drivers, mode, and seed.</li>
+      <li class="ui"><b>UI</b> controls for random/Elo-based generation and seed display.</li>
+      <li class="test"><b>Test</b> same driver set/mode/seed yields same heats.</li>
+    </ul>
+    <div class="verify"><b>Verify:</b> <code>cargo test tournament_generation_is_deterministic</code></div>
+  </section>
+
+  <h2 class="section" id="decisions">Design Decisions</h2>
+  <div class="decisions">
+    <article class="decision" id="decision-1">
+      <h4>Keep RaceEngine UI- and transport-independent</h4>
+      <p>Race rules stay in Rust domain code; CLI, HTTP, SSE, debug UI, GPIO, and SvelteKit only feed commands or read projected state.</p>
+      <p class="meta"><b>Why:</b> one rule path is easier to test and replay · <b>Revisit if:</b> multiple race formats require separate rule engines.</p>
+    </article>
+    <article class="decision" id="decision-2">
+      <h4>SQLite remains the only Rennprotokoll store</h4>
+      <p>Every race event counts only after a SQLite transaction commits to the append-only <code>race_events</code> table.</p>
+      <p class="meta"><b>Why:</b> simplest durable recovery on Raspberry Pi · <b>Revisit if:</b> write latency is measured as race-affecting.</p>
+    </article>
+    <article class="decision" id="decision-3">
+      <h4>Use HTTP POST for commands and SSE for live display</h4>
+      <p>Commands stay request/response; live state updates stream as server-sent events.</p>
+      <p class="meta"><b>Why:</b> less state than WebSockets and matches ADR 0002 · <b>Revisit if:</b> bidirectional realtime controls become necessary.</p>
+    </article>
+    <article class="decision" id="decision-4">
+      <h4>Debug page before SvelteKit production UI</h4>
+      <p>The next UI should be a tiny static debug page served by Rust, not a full frontend scaffold.</p>
+      <p class="meta"><b>Why:</b> proves HTTP/SSE endpoints with minimal code · <b>Revisit if:</b> debug and production UI start duplicating too much code.</p>
+    </article>
+    <article class="decision" id="decision-5">
+      <h4>Hardware behind small seams</h4>
+      <p>GPIO input and relay output adapters sit outside RaceEngine and use the same command/state paths as simulation.</p>
+      <p class="meta"><b>Why:</b> simulation remains testable off-Pi · <b>Revisit if:</b> interrupt timing forces a lower-level capture queue.</p>
+    </article>
+    <article class="decision" id="decision-6">
+      <h4>Public API is read-only</h4>
+      <p>Mutating endpoints bind locally; public WLAN clients get display state only.</p>
+      <p class="meta"><b>Why:</b> avoids accidental remote race control · <b>Revisit if:</b> authenticated remote control is explicitly required.</p>
+    </article>
+  </div>
+
+  <h2 class="section" id="ticket-notes">Ticket-ready design notes</h2>
+  <div class="note">
+    Build LapX as thin tracer bullets. The core RaceEngine/Rennprotokoll/CLI path is already split from transport. Next ticket should start at Slice 10: add a local Rust HTTP state endpoint backed by the existing SQLite EventStore and RaceEngine projection. Do not add SvelteKit, GPIO, auth, or a command bus in that ticket; those are later slices with their own verification.
+  </div>
+</main>
+</body>
+</html>
