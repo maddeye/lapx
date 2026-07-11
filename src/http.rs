@@ -1,5 +1,6 @@
 use crate::{
     domain::{ChaosSource, Command, RaceConfig, SignalEdge},
+    hardware::HardwareSnapshot,
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
     store::StoreError,
 };
@@ -18,6 +19,7 @@ pub fn router(runtime: Arc<RaceRuntime>) -> Router {
     Router::new()
         .route("/api/state", get(state))
         .route("/api/state/stream", get(state_stream))
+        .route("/api/hardware", get(hardware_state))
         .route("/api/start", post(start))
         .route("/api/sensor", post(sensor))
         .route("/api/pause", post(pause))
@@ -25,6 +27,7 @@ pub fn router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/chaos", post(chaos))
         .route("/api/correct-laps", post(correct_laps))
         .route("/debug", get(debug))
+        .route("/hardware", get(hardware))
         .with_state(runtime)
 }
 
@@ -52,6 +55,15 @@ struct CorrectionInput {
 
 async fn state(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<StateSnapshot>, HttpError> {
     Ok(Json(runtime.snapshot().await?))
+}
+
+async fn hardware_state(
+    State(runtime): State<Arc<RaceRuntime>>,
+) -> Result<Json<HardwareSnapshot>, HttpError> {
+    runtime
+        .hardware_snapshot()
+        .map(Json)
+        .ok_or(HttpError::HardwareUnavailable)
 }
 
 async fn start(
@@ -173,9 +185,14 @@ async fn debug() -> Html<&'static str> {
     Html(include_str!("debug.html"))
 }
 
+async fn hardware() -> Html<&'static str> {
+    Html(include_str!("hardware.html"))
+}
+
 #[derive(Debug)]
 enum HttpError {
     Malformed(String),
+    HardwareUnavailable,
     Runtime(RuntimeError),
 }
 
@@ -191,6 +208,7 @@ impl IntoResponse for HttpError {
             Self::Malformed(_) | Self::Runtime(RuntimeError::Store(StoreError::Domain(_))) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::HardwareUnavailable => StatusCode::NOT_FOUND,
             Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -198,7 +216,8 @@ impl IntoResponse for HttpError {
         };
         let message = match &self {
             Self::Malformed(message) => message.clone(),
-            _ => format!("{self:?}"),
+            Self::Runtime(error) => error.to_string(),
+            Self::HardwareUnavailable => "hardware is not configured".into(),
         };
         (status, message).into_response()
     }
