@@ -42,17 +42,17 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Race completeness
 
-- [ ] **Delivery 7 — [Fehlstartfolge](.plans/best-path/slice-05.html)**
+- [x] **Delivery 7 — [Fehlstartfolge](.plans/best-path/slice-05.html)**
   - Detect Fehlstart and apply abort, result-time penalty, or intended lane power-off.
   - Extend `lapxctl` through the existing command/store path.
   - Verify: `cargo test false_start messereignis_during_startsequence`.
 
-- [ ] **Delivery 8 — [Rennpause and Wiederanlaufsequenz](.plans/best-path/slice-06.html)**
+- [x] **Delivery 8 — [Rennpause and Wiederanlaufsequenz](.plans/best-path/slice-06.html)**
   - Freeze race time and intended power, continue accepting rolling laps, and resume through a due sequence.
   - Extend `lapxctl` with pause and resume.
   - Verify: `cargo test rennpause restart_sequence resume_sequence`.
 
-- [ ] **Delivery 9 — [Chaosauslösung](.plans/best-path/slice-07.html)**
+- [x] **Delivery 9 — [Chaosauslösung](.plans/best-path/slice-07.html)**
   - Reuse Rennpause and Fehlstartfolge behavior for lane and race-control Chaostaster commands.
   - Extend `lapxctl` with chaos commands.
   - Verify: `cargo test chaos lane_power_off_expiry`.

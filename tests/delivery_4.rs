@@ -4,9 +4,12 @@ fn running() -> (RaceEngine, Vec<Event>) {
     let config = RaceConfig {
         lanes: 2,
         start_sequence_ms: 1_000,
+        restart_sequence_ms: 500,
         minimum_lap_time_ms: 3_000,
         finish_condition: FinishCondition::Laps(10),
         finish_mode: FinishMode::Immediate,
+        false_start_consequence: Consequence::Abort,
+        chaos_consequence: Consequence::Abort,
     };
     let mut events = RaceEngine::new()
         .handle(Command::StartRace { config, at: 0 })

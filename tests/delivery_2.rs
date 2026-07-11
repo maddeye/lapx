@@ -4,9 +4,12 @@ fn config() -> RaceConfig {
     RaceConfig {
         lanes: 2,
         start_sequence_ms: 1_000,
+        restart_sequence_ms: 500,
         minimum_lap_time_ms: 3_000,
         finish_condition: FinishCondition::Laps(10),
         finish_mode: FinishMode::Immediate,
+        false_start_consequence: Consequence::Abort,
+        chaos_consequence: Consequence::Abort,
     }
 }
 
@@ -26,11 +29,13 @@ fn replay() {
         serde_json::to_vec(second.state()).unwrap()
     );
     assert!(matches!(
-        &first.state().phase,
-        RacePhase::Starting {
-            start_due_at: 1_100,
+        &first.state().status,
+        RaceStatus::Active(ActiveRace {
+            lifecycle: Lifecycle::Starting {
+                start_due_at: 1_100,
+            },
             ..
-        }
+        })
     ));
     assert_eq!(first.state().lanes.len(), 2);
 }
@@ -180,18 +185,22 @@ fn lifecycle_data_is_carried_by_typed_phase_variants() {
         })
         .unwrap();
     let state = RaceEngine::replay(&events).unwrap();
-    let RacePhase::Starting {
+    let RaceStatus::Active(ActiveRace {
         config,
-        start_due_at,
-    } = &state.state().phase
+        lifecycle: Lifecycle::Starting { start_due_at },
+        control: RaceControl::Live,
+        accumulated_pause_ms: 0,
+    }) = &state.state().status
     else {
-        panic!("expected starting phase");
+        panic!("expected active starting race");
     };
     assert_eq!(config.lanes, 2);
     assert_eq!(*start_due_at, 1_100);
 
     let json = serde_json::to_value(state.state()).unwrap();
-    assert_eq!(json["phase"], "starting");
+    assert_eq!(json["status"], "active");
+    assert_eq!(json["lifecycle"], "starting");
+    assert_eq!(json["control"], "live");
     assert_eq!(json["start_due_at"], 1_100);
     assert!(json.get("official_start_at").is_none());
     assert!(json.get("finished_at").is_none());
