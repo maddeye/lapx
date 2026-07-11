@@ -4,8 +4,8 @@ use lapx::{
         RaceControl, RaceStatus, SignalEdge,
     },
     hardware::{
-        HardwareConfig, HardwareError, InputConfig, LaneHardwareConfig, PowerOutput, PullMode,
-        RawEdge, RelayConfig, SimulationPowerOutput, SimulationTimingSource,
+        CapturedAt, HardwareConfig, HardwareError, InputConfig, LaneHardwareConfig, PowerOutput,
+        PullMode, RawEdge, RelayConfig, SimulationPowerOutput, SimulationTimingSource,
     },
     runtime::{RaceRuntime, RuntimeError},
     store::SqliteStore,
@@ -306,7 +306,7 @@ async fn power_fault_stays_off_through_refresh_edge_and_due_until_resume() {
         .emit(RawEdge {
             lane: 1,
             edge: SignalEdge::Rising,
-            captured_at: tokio::time::Instant::now(),
+            captured_at: CapturedAt::Simulation(tokio::time::Instant::now()),
         })
         .unwrap();
     runtime
@@ -453,6 +453,103 @@ async fn startup_all_lanes_off_and_recovered_race_requires_resume() {
         store.events("race").unwrap().last(),
         Some(Event::RacePaused { .. })
     ));
+}
+
+#[tokio::test]
+async fn recovered_lane_mismatch_fails_before_recovery_changes_state() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("mismatch.db")).unwrap();
+    let started = store
+        .execute(
+            "race",
+            Command::StartRace {
+                config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+                at: 0,
+            },
+        )
+        .unwrap();
+    let power = RecordingPower::default();
+    let calls = power.calls.clone();
+    let one_lane = HardwareConfig::new(vec![hardware_config().lanes[0].clone()]).unwrap();
+
+    let result = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        one_lane,
+        SimulationTimingSource::default(),
+        power,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(RuntimeError::HardwareLaneMismatch {
+            configured: 1,
+            requested: 2
+        })
+    ));
+    assert_eq!(*calls.lock().unwrap(), vec![[false; 4]]);
+    assert_eq!(store.load("race").unwrap().sequence, started.sequence);
+}
+
+#[tokio::test]
+async fn external_lane_mismatch_latches_fault_without_powering_on() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("external-mismatch.db")).unwrap();
+    let power = RecordingPower::default();
+    let calls = power.calls.clone();
+    let one_lane = HardwareConfig::new(vec![hardware_config().lanes[0].clone()]).unwrap();
+    let runtime = RaceRuntime::with_hardware(
+        store.clone(),
+        "race",
+        one_lane,
+        SimulationTimingSource::default(),
+        power,
+    )
+    .await
+    .unwrap();
+    store
+        .execute(
+            "race",
+            Command::StartRace {
+                config: race_config(FinishCondition::Laps(10), Consequence::Abort),
+                at: 0,
+            },
+        )
+        .unwrap();
+    store
+        .execute("race", Command::AdvanceRace { to: 10 })
+        .unwrap();
+
+    let error = runtime.snapshot().await.unwrap_err();
+    assert!(matches!(error, RuntimeError::PowerAfterCommit { .. }));
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|outputs| *outputs == [false; 4])
+    );
+    assert!(
+        runtime
+            .hardware_snapshot()
+            .unwrap()
+            .last_error
+            .unwrap()
+            .contains("race requests 2 lanes but hardware configures 1")
+    );
+
+    let resume = runtime
+        .apply(Command::ResumeRace { at: 20 })
+        .await
+        .unwrap_err();
+    assert!(matches!(resume, RuntimeError::PowerAfterCommit { .. }));
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|outputs| *outputs == [false; 4])
+    );
 }
 
 #[tokio::test]

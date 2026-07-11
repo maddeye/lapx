@@ -12,6 +12,7 @@ pub(super) struct Dispatcher {
     race_id: String,
     head: StateSnapshot,
     receiver: mpsc::UnboundedReceiver<Ingress>,
+    pending: VecDeque<Ingress>,
     shared: Arc<Shared>,
     hardware: Option<DispatcherHardware>,
     refresh_at: Instant,
@@ -33,6 +34,7 @@ impl Dispatcher {
                 race_id,
                 head,
                 receiver,
+                pending: VecDeque::new(),
                 shared,
                 hardware,
                 refresh_at: Instant::now() + REFRESH_INTERVAL,
@@ -44,6 +46,10 @@ impl Dispatcher {
 
     async fn run(mut self) {
         loop {
+            if let Some(ingress) = self.pending.pop_front() {
+                self.handle_ingress(ingress).await;
+                continue;
+            }
             let wake_at = self.wake_at();
             tokio::select! {
                 biased;
@@ -77,16 +83,12 @@ impl Dispatcher {
     async fn handle_ingress(&mut self, ingress: Ingress) {
         match ingress {
             Ingress::Command { request, response } => {
+                if let Some(due) = self.crossed_due(&request) {
+                    self.settle_edges_through(due).await;
+                }
                 let _ = response.send(self.handle_command(request).await);
             }
-            Ingress::RawEdge(edge) => {
-                if let Err(error) = self.handle_edge(edge).await {
-                    if let Some(hardware) = &self.hardware {
-                        hardware.monitor.record_error(error.to_string());
-                    }
-                    eprintln!("timing edge apply failed: {error}");
-                }
-            }
+            Ingress::RawEdge(edge) => self.handle_edge_batch(edge).await,
             Ingress::Snapshot { response } => {
                 let result = self.refresh_external().await.map(|()| self.head.clone());
                 let _ = response.send(result);
@@ -95,7 +97,7 @@ impl Dispatcher {
     }
 
     async fn handle_timer(&mut self) {
-        let now = match self.shared.protocol_now() {
+        let mut now = match self.shared.protocol_now() {
             Ok(now) => now,
             Err(error) => {
                 eprintln!("race clock failed: {error}");
@@ -103,7 +105,19 @@ impl Dispatcher {
                 return;
             }
         };
-        let due = self.head.state.next_due_at().ok().flatten();
+        let mut due = self.head.state.next_due_at().ok().flatten();
+        if let Some(due_at) = due.filter(|due| self.hardware.is_some() && *due <= now) {
+            self.settle_edges_through(due_at).await;
+            now = match self.shared.protocol_now() {
+                Ok(now) => now,
+                Err(error) => {
+                    eprintln!("race clock failed after edge settle: {error}");
+                    self.timer_retry_at = Instant::now() + REFRESH_INTERVAL;
+                    return;
+                }
+            };
+            due = self.head.state.next_due_at().ok().flatten();
+        }
         let result = if due.is_some_and(|due| due <= now) {
             self.handle_command(CommandRequest::Exact(Command::AdvanceRace { to: now }))
                 .await
@@ -116,6 +130,72 @@ impl Dispatcher {
             Err(error) => {
                 eprintln!("race timer apply failed: {error}");
                 self.timer_retry_at = Instant::now() + REFRESH_INTERVAL;
+            }
+        }
+    }
+
+    fn crossed_due(&self, request: &CommandRequest) -> Option<ProtocolMillis> {
+        self.hardware.as_ref()?;
+        let at = match request {
+            CommandRequest::Exact(command) => command.timestamp(),
+            CommandRequest::Now(_) => self.shared.protocol_now().ok()?,
+        };
+        self.head
+            .state
+            .next_due_at()
+            .ok()
+            .flatten()
+            .filter(|due| *due <= at)
+    }
+
+    async fn handle_edge_batch(&mut self, first: RawEdge) {
+        let mut edges = vec![first];
+        let mut remaining = VecDeque::new();
+        while let Some(ingress) = self.pending.pop_front() {
+            match ingress {
+                Ingress::RawEdge(edge) => edges.push(edge),
+                ingress => remaining.push_back(ingress),
+            }
+        }
+        self.pending = remaining;
+        while let Ok(ingress) = self.receiver.try_recv() {
+            match ingress {
+                Ingress::RawEdge(edge) => edges.push(edge),
+                ingress => self.pending.push_back(ingress),
+            }
+        }
+        self.apply_edges(edges).await;
+    }
+
+    async fn settle_edges_through(&mut self, due: ProtocolMillis) {
+        tokio::time::sleep(CAPTURE_SETTLE_WINDOW).await;
+        while let Ok(ingress) = self.receiver.try_recv() {
+            self.pending.push_back(ingress);
+        }
+
+        let mut edges = Vec::new();
+        let mut remaining = VecDeque::new();
+        while let Some(ingress) = self.pending.pop_front() {
+            match ingress {
+                Ingress::RawEdge(edge) => match self.shared.protocol_at(edge.captured_at) {
+                    Ok(at) if at > due => remaining.push_back(Ingress::RawEdge(edge)),
+                    Ok(_) | Err(_) => edges.push(edge),
+                },
+                ingress => remaining.push_back(ingress),
+            }
+        }
+        self.pending = remaining;
+        self.apply_edges(edges).await;
+    }
+
+    async fn apply_edges(&mut self, mut edges: Vec<RawEdge>) {
+        edges.sort_by_key(|edge| (edge.captured_at, edge.lane));
+        for edge in edges {
+            if let Err(error) = self.handle_edge(edge).await {
+                if let Some(hardware) = &self.hardware {
+                    hardware.monitor.record_error(error.to_string());
+                }
+                eprintln!("timing edge apply failed: {error}");
             }
         }
     }
@@ -208,9 +288,18 @@ impl Dispatcher {
         let power = hardware.power.clone();
         let monitor = hardware.monitor.clone();
         let faulted = hardware.fault.is_some();
+        let configured = hardware.config.lanes.len() as u8;
         let known_sequence = self.head.sequence;
         let guarded = tokio::task::spawn_blocking(move || {
             store.with_immediate_head(&race_id, |snapshot| {
+                if let Some(mismatch) = hardware_lane_error(snapshot, configured) {
+                    if let Err(all_off) = write_outputs(&power, &monitor, [false; 4]) {
+                        return Err(HardwareError::new(format!(
+                            "{mismatch}; mismatch fail-safe all-off failed: {all_off}"
+                        )));
+                    }
+                    return Err(mismatch);
+                }
                 let write = force_write || snapshot.sequence != known_sequence;
                 if !write || (faulted && !resume) {
                     return Ok::<bool, HardwareError>(false);
@@ -258,7 +347,9 @@ impl Dispatcher {
             }
             Err(ImmediateError::Store(error)) => Err(error.into()),
             Err(ImmediateError::Callback { snapshot, source }) => {
-                self.hardware.as_mut().unwrap().fault = Some(source.clone());
+                let hardware = self.hardware.as_mut().unwrap();
+                hardware.monitor.record_error(source.to_string());
+                hardware.fault = Some(source.clone());
                 let (snapshot, pause_error) = self.pause_for_fault(*snapshot, source.clone()).await;
                 self.accept_head(snapshot.clone());
                 Err(RuntimeError::PowerAfterCommit {
@@ -270,7 +361,7 @@ impl Dispatcher {
     }
 
     async fn pause_for_fault(
-        &self,
+        &mut self,
         snapshot: StateSnapshot,
         source: HardwareError,
     ) -> (StateSnapshot, Option<HardwareError>) {

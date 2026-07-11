@@ -314,6 +314,7 @@ dependencies = [
  "async-stream",
  "axum",
  "http-body-util",
+ "libc",
  "rppal",
  "rusqlite",
  "serde",

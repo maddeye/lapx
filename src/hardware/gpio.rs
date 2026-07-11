@@ -1,9 +1,9 @@
 use super::{
-    EdgeSink, HardwareConfig, HardwareError, PowerOutput, PullMode, RawEdge, TimingSource,
+    CapturedAt, EdgeSink, HardwareConfig, HardwareError, PowerOutput, PullMode, RawEdge,
+    TimingSource,
 };
 use crate::domain::SignalEdge;
 use rppal::gpio::{Gpio, InputPin, Level, OutputPin, Trigger};
-use tokio::time::Instant;
 
 pub struct GpioTimingSource {
     config: HardwareConfig,
@@ -32,6 +32,7 @@ impl TimingSource for GpioTimingSource {
             let lane = mapping.lane;
             let sink = sink.clone();
             pin.set_async_interrupt(Trigger::Both, None, move |event| {
+                let captured_at = event.timestamp;
                 let edge = match event.trigger {
                     Trigger::RisingEdge => SignalEdge::Rising,
                     Trigger::FallingEdge => SignalEdge::Falling,
@@ -40,7 +41,7 @@ impl TimingSource for GpioTimingSource {
                 let _ = sink.accept(RawEdge {
                     lane,
                     edge,
-                    captured_at: Instant::now(),
+                    captured_at: CapturedAt::KernelMonotonic(captured_at),
                 });
             })
             .map_err(gpio_error)?;

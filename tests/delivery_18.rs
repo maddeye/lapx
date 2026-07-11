@@ -5,8 +5,8 @@ use axum::{
 use lapx::{
     domain::SignalEdge,
     hardware::{
-        HardwareConfig, HardwareSnapshot, InputConfig, LaneHardwareConfig, PullMode, RawEdge,
-        RelayConfig, SimulationPowerOutput, SimulationTimingSource,
+        CapturedAt, HardwareConfig, HardwareSnapshot, InputConfig, LaneHardwareConfig, PullMode,
+        RawEdge, RelayConfig, SimulationPowerOutput, SimulationTimingSource,
     },
     http::router,
     runtime::RaceRuntime,
@@ -49,7 +49,7 @@ async fn hardware_page_loads_snapshot_with_lane_pin_mapping_and_polling() {
         .emit(RawEdge {
             lane: 1,
             edge: SignalEdge::Rising,
-            captured_at: Instant::now(),
+            captured_at: CapturedAt::Simulation(Instant::now()),
         })
         .unwrap();
     let app = router(runtime);

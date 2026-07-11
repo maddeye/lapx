@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::time::Instant;
 
@@ -135,11 +136,17 @@ fn parse_number(value: &str, name: &str) -> Result<u8, HardwareError> {
         .map_err(|_| HardwareError::new(format!("invalid {name}")))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapturedAt {
+    Simulation(Instant),
+    KernelMonotonic(Duration),
+}
+
 #[derive(Clone, Debug)]
 pub struct RawEdge {
     pub lane: u8,
     pub edge: SignalEdge,
-    pub captured_at: Instant,
+    pub captured_at: CapturedAt,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

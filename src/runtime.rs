@@ -4,13 +4,14 @@ pub use crate::store::StateSnapshot;
 use crate::{
     domain::{Command, ProtocolMillis, RaceControl, RaceStatus},
     hardware::{
-        EdgeSink, HardwareConfig, HardwareError, HardwareMonitor, HardwareSnapshot, PowerOutput,
-        RawEdge, TimingSource,
+        CapturedAt, EdgeSink, HardwareConfig, HardwareError, HardwareMonitor, HardwareSnapshot,
+        PowerOutput, RawEdge, TimingSource,
     },
     store::{ImmediateError, SqliteStore, StoreError},
 };
 use dispatcher::{Dispatcher, DispatcherHardware, needs_pause};
 use std::{
+    collections::VecDeque,
     fmt,
     sync::{
         Arc, Mutex as StdMutex,
@@ -25,6 +26,8 @@ use tokio::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+// Allows kernel callback threads to enqueue edges captured just before a due timestamp.
+const CAPTURE_SETTLE_WINDOW: Duration = Duration::from_millis(5);
 
 type CommandResult = Result<StateSnapshot, RuntimeError>;
 type NowCommand = Box<dyn FnOnce(ProtocolMillis) -> Command + Send>;
@@ -44,6 +47,7 @@ pub enum RuntimeError {
     },
     DispatcherStopped,
     ClockOverflow,
+    MonotonicClock(std::io::Error),
 }
 
 impl fmt::Display for RuntimeError {
@@ -89,21 +93,39 @@ impl From<HardwareError> for RuntimeError {
 struct ProtocolClock {
     protocol_at_anchor: ProtocolMillis,
     instant_anchor: Instant,
+    monotonic_anchor: Option<Duration>,
 }
 
 impl ProtocolClock {
     fn now(&self) -> Result<ProtocolMillis, RuntimeError> {
-        self.at(Instant::now())
+        self.at(CapturedAt::Simulation(Instant::now()))
     }
 
-    fn at(&self, instant: Instant) -> Result<ProtocolMillis, RuntimeError> {
-        if instant >= self.instant_anchor {
+    fn at(&self, captured_at: CapturedAt) -> Result<ProtocolMillis, RuntimeError> {
+        let (after_anchor, elapsed) = match captured_at {
+            CapturedAt::Simulation(instant) if instant >= self.instant_anchor => {
+                (true, instant - self.instant_anchor)
+            }
+            CapturedAt::Simulation(instant) => (false, self.instant_anchor - instant),
+            CapturedAt::KernelMonotonic(timestamp) => {
+                let anchor = self.monotonic_anchor.ok_or_else(|| {
+                    HardwareError::new("kernel monotonic clock was not calibrated")
+                })?;
+                if timestamp >= anchor {
+                    (true, timestamp - anchor)
+                } else {
+                    (false, anchor - timestamp)
+                }
+            }
+        };
+        let elapsed = duration_millis(elapsed)?;
+        if after_anchor {
             self.protocol_at_anchor
-                .checked_add(duration_millis(instant - self.instant_anchor)?)
+                .checked_add(elapsed)
                 .ok_or(RuntimeError::ClockOverflow)
         } else {
             self.protocol_at_anchor
-                .checked_sub(duration_millis(self.instant_anchor - instant)?)
+                .checked_sub(elapsed)
                 .ok_or(RuntimeError::ClockOverflow)
         }
     }
@@ -112,6 +134,7 @@ impl ProtocolClock {
         if self.now().is_ok_and(|now| at > now) {
             self.protocol_at_anchor = at;
             self.instant_anchor = Instant::now();
+            self.monotonic_anchor = kernel_monotonic_now().ok().flatten();
         }
     }
 }
@@ -134,11 +157,11 @@ impl Shared {
             .now()
     }
 
-    fn protocol_at(&self, instant: Instant) -> Result<ProtocolMillis, RuntimeError> {
+    fn protocol_at(&self, captured_at: CapturedAt) -> Result<ProtocolMillis, RuntimeError> {
         self.clock
             .lock()
             .map_err(|_| RuntimeError::ClockOverflow)?
-            .at(instant)
+            .at(captured_at)
     }
 
     fn publish(&self, snapshot: &StateSnapshot) {
@@ -194,7 +217,7 @@ impl RaceRuntime {
         let race_id = race_id.into();
         let initial = load_snapshot(&store, &race_id).await?;
         let (ingress, receiver) = mpsc::unbounded_channel();
-        let shared = shared(&initial);
+        let shared = shared(&initial, false)?;
         let runtime = Arc::new(Self {
             ingress,
             shared: shared.clone(),
@@ -216,8 +239,9 @@ impl RaceRuntime {
         P: PowerOutput + 'static,
     {
         let race_id = race_id.into();
-        let all_off = power.set_lane_power([false; 4]);
+        power.set_lane_power([false; 4])?;
         let mut initial = load_snapshot(&store, &race_id).await?;
+        validate_hardware_snapshot(&initial, &config)?;
         if needs_pause(&initial) {
             initial = execute_now(
                 &store,
@@ -227,12 +251,11 @@ impl RaceRuntime {
             )
             .await?;
         }
-        all_off?;
 
         let monitor = HardwareMonitor::new(config.clone());
         monitor.record_outputs([false; 4]);
         let (ingress, receiver) = mpsc::unbounded_channel();
-        let shared = shared(&initial);
+        let shared = shared(&initial, true)?;
         let edge_ingress = ingress.clone();
         timing.start(EdgeSink::new(move |edge| {
             edge_ingress
@@ -305,16 +328,75 @@ impl RaceRuntime {
     }
 }
 
-fn shared(initial: &StateSnapshot) -> Arc<Shared> {
+fn shared(initial: &StateSnapshot, hardware: bool) -> Result<Arc<Shared>, RuntimeError> {
     let (updates, _) = broadcast::channel(16);
-    Arc::new(Shared {
+    Ok(Arc::new(Shared {
         updates,
         published_sequence: AtomicU64::new(initial.sequence),
         clock: StdMutex::new(ProtocolClock {
             protocol_at_anchor: initial.state.last_event_at.unwrap_or(0),
             instant_anchor: Instant::now(),
+            monotonic_anchor: hardware.then(kernel_monotonic_now).transpose()?.flatten(),
         }),
+    }))
+}
+
+fn validate_hardware_snapshot(
+    snapshot: &StateSnapshot,
+    hardware: &HardwareConfig,
+) -> Result<(), RuntimeError> {
+    let Some(config) = snapshot.state.config() else {
+        return Ok(());
+    };
+    let configured = hardware.lanes.len() as u8;
+    if config.lanes == configured {
+        Ok(())
+    } else {
+        Err(RuntimeError::HardwareLaneMismatch {
+            configured,
+            requested: config.lanes,
+        })
+    }
+}
+
+fn hardware_lane_error(snapshot: &StateSnapshot, configured: u8) -> Option<HardwareError> {
+    let requested = snapshot.state.config()?.lanes;
+    (requested != configured).then(|| {
+        HardwareError::new(
+            RuntimeError::HardwareLaneMismatch {
+                configured,
+                requested,
+            }
+            .to_string(),
+        )
     })
+}
+
+#[cfg(feature = "gpio")]
+fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is valid writable storage for one `timespec`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return Err(RuntimeError::MonotonicClock(std::io::Error::last_os_error()));
+    }
+    Ok(Some(Duration::new(
+        timestamp
+            .tv_sec
+            .try_into()
+            .map_err(|_| RuntimeError::ClockOverflow)?,
+        timestamp
+            .tv_nsec
+            .try_into()
+            .map_err(|_| RuntimeError::ClockOverflow)?,
+    )))
+}
+
+#[cfg(not(feature = "gpio"))]
+fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
+    Ok(None)
 }
 
 async fn load_snapshot(store: &SqliteStore, race_id: &str) -> Result<StateSnapshot, RuntimeError> {
