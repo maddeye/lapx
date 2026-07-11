@@ -52,10 +52,10 @@ fn finish() {
                 Event::RaceFinished { .. }
             ]
         ));
-        assert_eq!(
+        assert!(matches!(
             RaceEngine::replay(&events).unwrap().state().phase,
-            RacePhase::Finished
-        );
+            RacePhase::Finished { .. }
+        ));
     }
 }
 
@@ -63,20 +63,20 @@ fn finish() {
 fn finish_leader_lap_waits_for_condition_time_leader() {
     let mut events = start(FinishCondition::TimeMs(100), FinishMode::LeaderLap);
     issue(&mut events, Command::AdvanceRace { to: 110 });
-    assert_eq!(
+    assert!(matches!(
         RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Finishing
-    );
+        RacePhase::Finishing { .. }
+    ));
     sensor(&mut events, 2, 120);
-    assert_eq!(
+    assert!(matches!(
         RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Finishing
-    );
+        RacePhase::Finishing { .. }
+    ));
     sensor(&mut events, 1, 121);
-    assert_eq!(
+    assert!(matches!(
         RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Finished
-    );
+        RacePhase::Finished { .. }
+    ));
 }
 
 #[test]
@@ -93,23 +93,35 @@ fn finish_all_current_lap_gives_each_lane_one_crossing() {
         })
     ));
     sensor(&mut events, 2, 221);
-    assert_eq!(
+    assert!(matches!(
         RaceEngine::replay(&events).unwrap().state().phase,
-        RacePhase::Finished
-    );
+        RacePhase::Finished { .. }
+    ));
 
     let mut lap_limited = start(FinishCondition::Laps(1), FinishMode::AllCurrentLap);
-    sensor(&mut lap_limited, 1, 110);
-    assert_eq!(
-        RaceEngine::replay(&lap_limited).unwrap().state().phase,
-        RacePhase::Finishing
-    );
-    sensor(&mut lap_limited, 1, 210);
+    let trigger = sensor(&mut lap_limited, 1, 110);
+    assert!(matches!(
+        trigger.as_slice(),
+        [
+            Event::MeasurementCaptured { .. },
+            Event::ValidLap { .. },
+            Event::FinishConditionReached { .. },
+            Event::LaneFinished { lane: 1, at: 110 }
+        ]
+    ));
+    let rejected = sensor(&mut lap_limited, 1, 210);
+    assert!(matches!(
+        rejected.last(),
+        Some(Event::MeasurementRejected {
+            reason: RejectionReason::LaneAlreadyFinished,
+            ..
+        })
+    ));
     sensor(&mut lap_limited, 2, 211);
-    assert_eq!(
-        RaceEngine::replay(&lap_limited).unwrap().state().phase,
-        RacePhase::Finished
-    );
+    let state = RaceEngine::replay(&lap_limited).unwrap();
+    assert!(matches!(state.state().phase, RacePhase::Finished { .. }));
+    assert_eq!(state.state().lane(1).unwrap().laps, 1);
+    assert_eq!(state.state().lane(2).unwrap().laps, 1);
 }
 
 #[test]
@@ -164,7 +176,7 @@ fn sensor_after_due_time() {
         ]
     ));
     assert_eq!(
-        RaceEngine::replay(&events).unwrap().state().finished_at,
+        RaceEngine::replay(&events).unwrap().state().finished_at(),
         Some(110)
     );
 }

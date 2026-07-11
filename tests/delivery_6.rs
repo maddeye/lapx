@@ -1,4 +1,7 @@
-use lapx::{domain::*, store::SqliteStore};
+use lapx::{
+    domain::*,
+    store::{SqliteStore, StoreError},
+};
 use rusqlite::Connection;
 use std::{
     io::Write,
@@ -49,6 +52,37 @@ fn sqlite_store_replays_committed_events() {
     };
     let reopened = SqliteStore::open(&path).unwrap();
     assert_eq!(reopened.load("race").unwrap(), before);
+}
+
+#[test]
+fn failed_command_leaves_protocol_and_state_unchanged_atomically() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
+    let before = store
+        .execute(
+            "race",
+            Command::StartRace {
+                config: config(),
+                at: 0,
+            },
+        )
+        .unwrap();
+    let events_before = store.events("race").unwrap();
+
+    assert!(matches!(
+        store.execute(
+            "race",
+            Command::SensorTriggered {
+                lane: 3,
+                at: 20,
+                edge: SignalEdge::Rising,
+            },
+        ),
+        Err(StoreError::Domain(DomainError::InvalidLane))
+    ));
+    assert_eq!(store.events("race").unwrap(), events_before);
+    assert_eq!(store.load("race").unwrap(), before);
+    assert!(matches!(before.phase, RacePhase::Starting { .. }));
 }
 
 #[test]
@@ -154,7 +188,7 @@ fn store_cli() {
         String::from_utf8_lossy(&output.stderr)
     );
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(state.phase, RacePhase::Starting);
+    assert!(matches!(state.phase, RacePhase::Starting { .. }));
 
     let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_lapxctl"))
         .args(["advance", "--json", "-"])
@@ -172,7 +206,7 @@ fn store_cli() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(state.phase, RacePhase::Running);
+    assert!(matches!(state.phase, RacePhase::Running { .. }));
 
     let sensor = dir.path().join("sensor.json");
     std::fs::write(
@@ -187,7 +221,7 @@ fn store_cli() {
         .unwrap();
     assert!(output.status.success());
     let state: RaceState = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(state.phase, RacePhase::Finished);
+    assert!(matches!(state.phase, RacePhase::Finished { .. }));
 
     let correction = dir.path().join("correct.json");
     std::fs::write(

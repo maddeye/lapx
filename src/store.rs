@@ -140,3 +140,25 @@ fn load_events(connection: &Connection, race_id: &str) -> Result<Vec<Event>, Sto
     }
     Ok(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn race_protocol_connections_use_wal_and_full_synchronous() {
+        let dir = tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
+        let connection = store.connect().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2); // SQLite FULL
+    }
+}

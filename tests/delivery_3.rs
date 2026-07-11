@@ -35,13 +35,61 @@ fn start_sequence() {
 }
 
 #[test]
-fn replay_at() {
-    let (engine, mut events) = started();
-    assert_eq!(engine.state().phase, RacePhase::Starting);
-    events.extend(engine.handle(Command::AdvanceRace { to: 2_000 }).unwrap());
-    let replayed = RaceEngine::replay(&events).unwrap();
-    assert_eq!(replayed.state().phase, RacePhase::Running);
-    assert_eq!(replayed.state().official_start_at, Some(1_100));
+fn replay_at_uses_only_committed_events_through_timestamp() {
+    let (starting, mut events) = started();
+    events.extend(starting.handle(Command::AdvanceRace { to: 1_100 }).unwrap());
+    let running = RaceEngine::replay(&events).unwrap();
+    events.extend(
+        running
+            .handle(Command::SensorTriggered {
+                lane: 1,
+                at: 4_100,
+                edge: SignalEdge::Rising,
+            })
+            .unwrap(),
+    );
+
+    assert!(matches!(
+        RaceEngine::replay_at(&events, 1_099).unwrap().state().phase,
+        RacePhase::Starting {
+            start_due_at: 1_100,
+            ..
+        }
+    ));
+    assert!(matches!(
+        RaceEngine::replay_at(&events, 1_100).unwrap().state().phase,
+        RacePhase::Running {
+            official_start_at: 1_100,
+            ..
+        }
+    ));
+    assert_eq!(
+        RaceEngine::replay_at(&events, 4_099)
+            .unwrap()
+            .state()
+            .lane(1)
+            .unwrap()
+            .laps,
+        0
+    );
+    assert_eq!(
+        RaceEngine::replay_at(&events, 4_100)
+            .unwrap()
+            .state()
+            .lane(1)
+            .unwrap()
+            .laps,
+        1
+    );
+
+    let (_, committed_before_due) = started();
+    assert!(matches!(
+        RaceEngine::replay_at(&committed_before_due, 9_999)
+            .unwrap()
+            .state()
+            .phase,
+        RacePhase::Starting { .. }
+    ));
 }
 
 #[test]
