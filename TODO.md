@@ -59,23 +59,23 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Local integration and Debug-Bedienung
 
-- [ ] **Delivery 10 — [Local HTTP state and due-event runtime](.plans/best-path/slice-10.html)**
+- [x] **Delivery 10 — [Local HTTP state and due-event runtime](.plans/best-path/slice-10.html)**
   - Serve `GET /api/state` on loopback and materialize due events without client activity.
   - Verify: `cargo test http_state_returns_json runtime_materializes_due_event`.
 
-- [ ] **Delivery 11 — [Local HTTP commands](.plans/best-path/slice-11.html)**
+- [x] **Delivery 11 — [Local HTTP commands](.plans/best-path/slice-11.html)**
   - Map explicit POST routes to the existing durable command path without duplicating rules.
   - Verify: `cargo test http_command_round_trip`.
 
-- [ ] **Delivery 12 — [SSE state stream](.plans/best-path/slice-12.html)**
+- [x] **Delivery 12 — [SSE state stream](.plans/best-path/slice-12.html)**
   - Add `RaceRuntime`, post-commit full-state broadcasts, sequence filtering, and reconnect-safe subscription.
   - Verify: `cargo test sse_emits_state_after_command` plus connection-race coverage.
 
-- [ ] **Delivery 13 — [Minimal Debug-Bedienung](.plans/best-path/slice-13.html)**
+- [x] **Delivery 13 — [Minimal Debug-Bedienung](.plans/best-path/slice-13.html)**
   - Serve one static local debug page using `fetch` and `EventSource`.
   - Verify: `cargo test debug_page_loads`; manually start a race and accept one lap without refresh.
 
-- [ ] **Delivery 14 — [Debug configuration and corrections](.plans/best-path/slice-14.html)**
+- [x] **Delivery 14 — [Debug configuration and corrections](.plans/best-path/slice-14.html)**
   - Add race configuration and post-race Rundenkorrektur controls to the same debug page.
   - Verify: `cargo test http_correction_updates_finished_race`.
 
