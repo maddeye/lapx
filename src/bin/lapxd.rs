@@ -1,6 +1,11 @@
 #[cfg(feature = "gpio")]
 use lapx::hardware::gpio::{GpioPowerOutput, GpioTimingSource};
-use lapx::{hardware::HardwareConfig, http::router, runtime::RaceRuntime, store::SqliteStore};
+use lapx::{
+    hardware::HardwareConfig,
+    http::{local_router, public_router},
+    runtime::RaceRuntime,
+    store::SqliteStore,
+};
 #[cfg(not(feature = "gpio"))]
 use std::io;
 use std::{env, error::Error};
@@ -32,7 +37,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         RaceRuntime::new(store, "race").await?
     };
-    let listener = TcpListener::bind("127.0.0.1:3000").await?;
-    axum::serve(listener, router(runtime)).await?;
+    let local_bind = env::var("LAPX_LOCAL_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let public_bind = env::var("LAPX_PUBLIC_BIND").unwrap_or_else(|_| "0.0.0.0:3001".into());
+    let local = TcpListener::bind(&local_bind).await?;
+    let public = TcpListener::bind(&public_bind).await?;
+    tokio::try_join!(
+        axum::serve(local, local_router(runtime.clone())),
+        axum::serve(public, public_router(runtime)),
+    )?;
     Ok(())
 }

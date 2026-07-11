@@ -8,7 +8,7 @@ use lapx::{
         CapturedAt, HardwareConfig, HardwareSnapshot, InputConfig, LaneHardwareConfig, PullMode,
         RawEdge, RelayConfig, SimulationPowerOutput, SimulationTimingSource,
     },
-    http::router,
+    http::local_router as router,
     runtime::RaceRuntime,
     store::SqliteStore,
 };

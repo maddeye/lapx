@@ -4,7 +4,7 @@ use axum::{
 };
 use lapx::{
     domain::{Consequence, FinishCondition, FinishMode, Lifecycle, RaceConfig, RaceStatus},
-    http::router,
+    http::local_router as router,
     runtime::{RaceRuntime, StateSnapshot},
     store::SqliteStore,
 };
