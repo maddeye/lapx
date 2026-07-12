@@ -12,13 +12,30 @@ use axum::{
     response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc};
 
-pub fn router(runtime: Arc<RaceRuntime>) -> Router {
+mod assets;
+
+/// Read-only surface safe for the public bind: state, SSE, and Rennscreen assets.
+/// Control-only assets are denied here (see `assets::public_app_asset`).
+pub fn public_router(runtime: Arc<RaceRuntime>) -> Router {
+    read_router(runtime).route("/_app/{*path}", get(assets::public_app_asset))
+}
+
+fn read_router(runtime: Arc<RaceRuntime>) -> Router {
     Router::new()
+        .route("/", get(assets::rennscreen))
         .route("/api/state", get(state))
         .route("/api/state/stream", get(state_stream))
+        .with_state(runtime)
+}
+
+/// Full surface for the loopback bind: public reads plus all mutating and debug routes.
+pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
+    Router::new()
+        .route("/control", get(assets::control))
+        .route("/_app/{*path}", get(assets::app_asset))
         .route("/api/hardware", get(hardware_state))
         .route("/api/start", post(start))
         .route("/api/sensor", post(sensor))
@@ -28,7 +45,29 @@ pub fn router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/correct-laps", post(correct_laps))
         .route("/debug", get(debug))
         .route("/hardware", get(hardware))
-        .with_state(runtime)
+        .with_state(runtime.clone())
+        .merge(read_router(runtime))
+}
+
+/// Snapshot plus derived display timing; serializes as a superset of `StateSnapshot`.
+/// One schema for GET /api/state, the SSE stream, and every command response.
+#[derive(Serialize)]
+struct HttpState {
+    #[serde(flatten)]
+    snapshot: StateSnapshot,
+    race_elapsed_ms: Option<u64>,
+    race_clock_running: bool,
+    protocol_now: u64,
+}
+
+fn http_state(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<HttpState, HttpError> {
+    let protocol_now = runtime.protocol_now()?;
+    Ok(HttpState {
+        race_elapsed_ms: snapshot.state.race_elapsed_ms(protocol_now),
+        race_clock_running: snapshot.state.race_clock_running(),
+        protocol_now,
+        snapshot,
+    })
 }
 
 #[derive(Deserialize)]
@@ -53,8 +92,9 @@ struct CorrectionInput {
     delta_thousandths: i64,
 }
 
-async fn state(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<StateSnapshot>, HttpError> {
-    Ok(Json(runtime.snapshot().await?))
+async fn state(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
+    let snapshot = runtime.snapshot().await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
 async fn hardware_state(
@@ -73,75 +113,69 @@ async fn hardware_state(
 async fn start(
     State(runtime): State<Arc<RaceRuntime>>,
     input: Result<Json<StartInput>, JsonRejection>,
-) -> Result<Json<StateSnapshot>, HttpError> {
+) -> Result<Json<HttpState>, HttpError> {
     let input = parse(input)?;
-    Ok(Json(
-        runtime
-            .apply_now(|at| Command::StartRace {
-                config: input.config,
-                at,
-            })
-            .await?,
-    ))
+    let snapshot = runtime
+        .apply_now(|at| Command::StartRace {
+            config: input.config,
+            at,
+        })
+        .await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
 async fn sensor(
     State(runtime): State<Arc<RaceRuntime>>,
     input: Result<Json<SensorInput>, JsonRejection>,
-) -> Result<Json<StateSnapshot>, HttpError> {
+) -> Result<Json<HttpState>, HttpError> {
     let input = parse(input)?;
-    Ok(Json(
-        runtime
-            .apply_now(move |at| Command::SensorTriggered {
-                lane: input.lane,
-                at,
-                edge: input.edge,
-            })
-            .await?,
-    ))
+    let snapshot = runtime
+        .apply_now(move |at| Command::SensorTriggered {
+            lane: input.lane,
+            at,
+            edge: input.edge,
+        })
+        .await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
-async fn pause(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<StateSnapshot>, HttpError> {
-    Ok(Json(
-        runtime.apply_now(|at| Command::PauseRace { at }).await?,
-    ))
+async fn pause(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
+    let snapshot = runtime.apply_now(|at| Command::PauseRace { at }).await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
-async fn resume(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<StateSnapshot>, HttpError> {
-    Ok(Json(
-        runtime.apply_now(|at| Command::ResumeRace { at }).await?,
-    ))
+async fn resume(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
+    let snapshot = runtime.apply_now(|at| Command::ResumeRace { at }).await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
 async fn chaos(
     State(runtime): State<Arc<RaceRuntime>>,
     input: Result<Json<ChaosInput>, JsonRejection>,
-) -> Result<Json<StateSnapshot>, HttpError> {
+) -> Result<Json<HttpState>, HttpError> {
     let input = parse(input)?;
-    Ok(Json(
-        runtime
-            .apply_now(move |at| Command::TriggerChaos {
-                source: input.source,
-                at,
-            })
-            .await?,
-    ))
+    let snapshot = runtime
+        .apply_now(move |at| Command::TriggerChaos {
+            source: input.source,
+            at,
+        })
+        .await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
 async fn correct_laps(
     State(runtime): State<Arc<RaceRuntime>>,
     input: Result<Json<CorrectionInput>, JsonRejection>,
-) -> Result<Json<StateSnapshot>, HttpError> {
+) -> Result<Json<HttpState>, HttpError> {
     let input = parse(input)?;
-    Ok(Json(
-        runtime
-            .apply_now(move |at| Command::CorrectLaps {
-                lane: input.lane,
-                delta_thousandths: input.delta_thousandths,
-                at,
-            })
-            .await?,
-    ))
+    let snapshot = runtime
+        .apply_now(move |at| Command::CorrectLaps {
+            lane: input.lane,
+            delta_thousandths: input.delta_thousandths,
+            at,
+        })
+        .await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
 }
 
 async fn state_stream(
@@ -149,9 +183,10 @@ async fn state_stream(
 ) -> Result<impl IntoResponse, HttpError> {
     let mut receiver = runtime.subscribe();
     let initial = runtime.snapshot().await?;
+    let initial = state_event(&runtime, initial)?;
     let states = stream! {
-        let mut sequence = initial.sequence;
-        yield Ok::<_, Infallible>(state_event(&initial));
+        let mut sequence = initial.1;
+        yield Ok::<_, Infallible>(initial.0);
         loop {
             let snapshot = match receiver.recv().await {
                 Ok(snapshot) => snapshot,
@@ -165,7 +200,11 @@ async fn state_stream(
             };
             if snapshot.sequence > sequence {
                 sequence = snapshot.sequence;
-                yield Ok(state_event(&snapshot));
+                // Clock failure ends the stream; the client reconnects.
+                match state_event(&runtime, snapshot) {
+                    Ok((event, _)) => yield Ok(event),
+                    Err(_) => break,
+                }
             }
         }
     };
@@ -178,19 +217,24 @@ fn parse<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
         .map_err(|error| HttpError::Malformed(error.to_string()))
 }
 
-fn state_event(snapshot: &StateSnapshot) -> Event {
-    Event::default()
+fn state_event(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<(Event, u64), HttpError> {
+    let sequence = snapshot.sequence;
+    let event = Event::default()
         .event("state")
-        .id(snapshot.sequence.to_string())
-        .data(serde_json::to_string(snapshot).expect("state snapshot is serializable"))
+        .id(sequence.to_string())
+        .data(
+            serde_json::to_string(&http_state(runtime, snapshot)?)
+                .expect("state snapshot is serializable"),
+        );
+    Ok((event, sequence))
 }
 
 async fn debug() -> Html<&'static str> {
-    Html(include_str!("debug.html"))
+    Html(include_str!("../debug.html"))
 }
 
 async fn hardware() -> Html<&'static str> {
-    Html(include_str!("hardware.html"))
+    Html(include_str!("../hardware.html"))
 }
 
 #[derive(Debug)]

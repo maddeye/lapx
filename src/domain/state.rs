@@ -155,6 +155,19 @@ impl RaceState {
         ))
     }
 
+    /// True while the race clock advances: an active race that is running or
+    /// finishing under live control. Canonical for every display clock.
+    pub fn race_clock_running(&self) -> bool {
+        matches!(
+            &self.status,
+            RaceStatus::Active(ActiveRace {
+                lifecycle: Lifecycle::Running { .. } | Lifecycle::Finishing { .. },
+                control: RaceControl::Live,
+                ..
+            })
+        )
+    }
+
     pub fn race_elapsed_ms(&self, at: ProtocolMillis) -> Option<ProtocolMillis> {
         match &self.status {
             RaceStatus::Active(active) => {

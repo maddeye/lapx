@@ -6,7 +6,7 @@ use lapx::{
     domain::{
         ActiveRace, Consequence, FinishCondition, FinishMode, RaceConfig, RaceControl, RaceStatus,
     },
-    http::router,
+    http::local_router as router,
     runtime::{RaceRuntime, StateSnapshot},
     store::SqliteStore,
 };

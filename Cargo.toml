@@ -10,6 +10,7 @@ gpio = ["dep:libc", "dep:rppal"]
 [dependencies]
 async-stream = "0.3"
 axum = "0.8"
+include_dir = "0.7"
 libc = { version = "0.2", optional = true }
 rppal = { version = "0.22.1", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"] }

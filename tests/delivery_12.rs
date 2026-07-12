@@ -5,7 +5,7 @@ use axum::{
 use http_body_util::BodyExt;
 use lapx::{
     domain::{Consequence, FinishCondition, FinishMode, RaceConfig},
-    http::router,
+    http::local_router as router,
     runtime::{RaceRuntime, StateSnapshot},
     store::SqliteStore,
 };

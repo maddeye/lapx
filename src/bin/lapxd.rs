@@ -1,10 +1,29 @@
 #[cfg(feature = "gpio")]
 use lapx::hardware::gpio::{GpioPowerOutput, GpioTimingSource};
-use lapx::{hardware::HardwareConfig, http::router, runtime::RaceRuntime, store::SqliteStore};
+use lapx::{
+    hardware::HardwareConfig,
+    http::{local_router, public_router},
+    runtime::RaceRuntime,
+    store::SqliteStore,
+};
 #[cfg(not(feature = "gpio"))]
 use std::io;
-use std::{env, error::Error};
+use std::{env, error::Error, net::SocketAddr};
 use tokio::net::TcpListener;
+
+/// Parses LAPX_LOCAL_BIND and rejects any non-loopback address before binding:
+/// the local surface carries mutating and debug routes.
+fn local_bind_addr(value: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = value
+        .parse()
+        .map_err(|error| format!("LAPX_LOCAL_BIND {value:?} is not a socket address: {error}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "LAPX_LOCAL_BIND {value:?} must be a loopback address; the local surface exposes mutating routes"
+        ));
+    }
+    Ok(addr)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -32,7 +51,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         RaceRuntime::new(store, "race").await?
     };
-    let listener = TcpListener::bind("127.0.0.1:3000").await?;
-    axum::serve(listener, router(runtime)).await?;
+    let local_bind = env::var("LAPX_LOCAL_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let public_bind = env::var("LAPX_PUBLIC_BIND").unwrap_or_else(|_| "0.0.0.0:3001".into());
+    let local_addr = local_bind_addr(&local_bind)?;
+    let public_addr: SocketAddr = public_bind.parse().map_err(|error| {
+        format!("LAPX_PUBLIC_BIND {public_bind:?} is not a socket address: {error}")
+    })?;
+    let local = TcpListener::bind(local_addr).await?;
+    let public = TcpListener::bind(public_addr).await?;
+    tokio::try_join!(
+        axum::serve(local, local_router(runtime.clone())),
+        axum::serve(public, public_router(runtime)),
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_bind_addr;
+
+    #[test]
+    fn local_bind_rejects_non_loopback() {
+        assert!(local_bind_addr("127.0.0.1:3000").is_ok());
+        assert!(local_bind_addr("[::1]:3000").is_ok());
+        assert!(local_bind_addr("0.0.0.0:3000").is_err());
+        assert!(local_bind_addr("192.168.1.10:3000").is_err());
+        assert!(local_bind_addr("[::]:3000").is_err());
+        assert!(local_bind_addr("not-an-address").is_err());
+    }
 }

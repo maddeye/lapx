@@ -2,7 +2,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use lapx::{http::router, runtime::RaceRuntime, store::SqliteStore};
+use lapx::{http::local_router as router, runtime::RaceRuntime, store::SqliteStore};
 use tempfile::tempdir;
 use tower::ServiceExt;
 

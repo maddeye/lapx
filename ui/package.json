@@ -1,0 +1,20 @@
+{
+  "name": "lapx-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build && node generate-public-assets.js && find \"${LAPX_UI_OUT:-build}\" -type f -exec sed -i 's/[[:space:]]\\+$//' {} +",
+    "check": "svelte-check",
+    "test": "node --test tests/*.test.js && svelte-check && node verify-build.js"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.69.2",
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "svelte": "^5.56.4",
+    "svelte-check": "^4.7.2",
+    "vite": "^8.1.4"
+  }
+}
