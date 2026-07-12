@@ -155,6 +155,7 @@ impl Dispatcher {
                     },
                     1,
                 ),
+                Ingress::SwitchRace { .. } => (u64::MAX, 2),
                 Ingress::Snapshot { .. } => unreachable!("snapshots are batch barriers"),
             };
             (at, priority, *arrival)
@@ -181,6 +182,16 @@ impl Dispatcher {
                 let result = self.refresh_external().await.map(|()| self.head.clone());
                 let _ = response.send(result);
             }
+            Ingress::SwitchRace {
+                expected_race_id,
+                next_race_id,
+                response,
+            } => {
+                let _ = response.send(
+                    self.handle_switch_race(expected_race_id, next_race_id)
+                        .await,
+                );
+            }
         }
     }
 
@@ -191,15 +202,51 @@ impl Dispatcher {
         if !hardware.monitor.record_edge(edge.lane, edge.edge, edge.at) {
             return Ok(self.head.clone());
         }
-        self.execute_command(
-            Command::SensorTriggered {
-                lane: edge.lane,
-                edge: edge.edge,
-                at: edge.at,
-            },
-            false,
-        )
-        .await
+        let command = Command::SensorTriggered {
+            lane: edge.lane,
+            edge: edge.edge,
+            at: edge.at,
+        };
+        loop {
+            match self.execute_command(command.clone(), false).await {
+                Err(RuntimeError::Store(error)) if error.is_busy() => {
+                    tokio::time::sleep(REFRESH_INTERVAL).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn handle_switch_race(
+        &mut self,
+        expected_race_id: String,
+        next_race_id: String,
+    ) -> CommandResult {
+        let store = self.store.clone();
+        let hardware = self
+            .hardware
+            .as_ref()
+            .map(|hardware| (hardware.power.clone(), hardware.monitor.clone()));
+        let committed = tokio::task::spawn_blocking(move || {
+            store.switch_current_race_with(&expected_race_id, &next_race_id, || {
+                if let Some((power, monitor)) = &hardware {
+                    write_outputs(power, monitor, [false; 4])?;
+                }
+                Ok::<_, HardwareError>(())
+            })
+        })
+        .await?;
+        let committed = match committed {
+            Ok(snapshot) => snapshot,
+            Err(ImmediateError::Store(error)) => return Err(error.into()),
+            Err(ImmediateError::Callback { source, .. }) => return Err(source.into()),
+        };
+        if let Some(hardware) = &mut self.hardware {
+            hardware.fault = None;
+        }
+        self.race_id = committed.race_id.clone();
+        self.accept_head(committed.clone());
+        Ok(committed)
     }
 
     async fn handle_command(&mut self, request: CommandRequest) -> CommandResult {

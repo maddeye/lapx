@@ -9,8 +9,8 @@
  */
 export function createStateClient(onChange, deps = {}) {
 	const now = deps.now ?? (() => performance.now());
-	let sequence = -1;
 	let snapshot = null;
+	const seenRaceIds = new Set();
 	let connection = 'verbinde …';
 	let receivedAt = 0;
 	let connected = false;
@@ -21,13 +21,23 @@ export function createStateClient(onChange, deps = {}) {
 	return {
 		now,
 		accept(state, refresh = false) {
-			if (
-				typeof state?.sequence !== 'number' ||
-				state.sequence < sequence ||
-				(state.sequence === sequence && !refresh)
-			) return false;
-			sequence = state.sequence;
+			if (typeof state?.race_id !== 'string' || !state.race_id || typeof state.sequence !== 'number') {
+				return false;
+			}
+			if (snapshot) {
+				const sameRace = state.race_id === snapshot.race_id;
+				const terminal = snapshot.state?.status === 'finished' || snapshot.state?.status === 'aborted';
+				const nextRace =
+					terminal &&
+					!seenRaceIds.has(state.race_id) &&
+					((state.sequence === 0 && state.state?.status === 'ready') || refresh);
+				if (
+					(sameRace && (state.sequence < snapshot.sequence || (state.sequence === snapshot.sequence && !refresh))) ||
+					(!sameRace && !nextRace)
+				) return false;
+			}
 			snapshot = state;
+			seenRaceIds.add(state.race_id);
 			receivedAt = now();
 			emit();
 			return true;

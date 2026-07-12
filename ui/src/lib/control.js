@@ -25,6 +25,10 @@ export function startPayload(form) {
 	};
 }
 
+export function nextRacePayload(expectedRaceId, nextRaceId) {
+	return { expected_race_id: expectedRaceId, next_race_id: nextRaceId };
+}
+
 export function sensorPayload(lane, edge) {
 	return { lane: Number(lane), edge };
 }

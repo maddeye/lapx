@@ -16,6 +16,13 @@
 </head>
 <body>
   <h1>LapX Debug-Bedienung</h1>
+  <fieldset id="race-switch" hidden>
+    <legend>Next race</legend>
+    <p>Current race: <strong id="current_race">–</strong></p>
+    <label>next_race_id<input id="next_race_id" required></label>
+    <button id="next-race">Switch to next race</button>
+  </fieldset>
+
   <fieldset>
     <legend>RaceConfig</legend>
     <label>lanes<input id="lanes" type="number" value="4"></label>
@@ -70,10 +77,23 @@
   <script>
     const byId = id => document.getElementById(id);
     const number = id => Number(byId(id).value);
-    let sequence = -1;
+    let current = null;
+    let allowCurrent = false;
+    const seenRaceIds = new Set();
     const show = snapshot => {
-      if (snapshot.sequence <= sequence) return;
-      sequence = snapshot.sequence;
+      if (typeof snapshot?.race_id !== 'string' || typeof snapshot.sequence !== 'number') return;
+      if (current) {
+        const sameRace = snapshot.race_id === current.race_id;
+        const terminal = current.state?.status === 'finished' || current.state?.status === 'aborted';
+        const nextRace = terminal && !seenRaceIds.has(snapshot.race_id) &&
+          ((snapshot.sequence === 0 && snapshot.state?.status === 'ready') || allowCurrent);
+        if ((sameRace && snapshot.sequence <= current.sequence) || (!sameRace && !nextRace)) return;
+      }
+      current = snapshot;
+      seenRaceIds.add(snapshot.race_id);
+      allowCurrent = false;
+      byId('current_race').textContent = snapshot.race_id;
+      byId('race-switch').hidden = !['finished', 'aborted'].includes(snapshot.state?.status);
       byId('state').textContent = JSON.stringify(snapshot, null, 2);
     };
     const consequence = prefix => {
@@ -95,6 +115,10 @@
     }
     const report = action => action().catch(error => byId('errors').textContent = error.message);
 
+    byId('next-race').onclick = () => report(() => send('/api/next-race', {
+      expected_race_id: current.race_id,
+      next_race_id: byId('next_race_id').value
+    }));
     byId('start').onclick = () => report(() => {
       const finishKind = byId('finish_condition').value;
       return send('/api/start', { config: {
@@ -112,7 +136,7 @@
       report(() => send('/api/sensor', { lane: Number(button.dataset.lane), edge: 'rising' })));
     const commandPaths = { pause: '/api/pause', resume: '/api/resume' };
     document.querySelectorAll('[data-command]').forEach(button => button.onclick = () =>
-      report(() => send(commandPaths[button.dataset.command])));
+      report(() => send(commandPaths[button.dataset.command], {})));
     byId('race-chaos').onclick = () => report(() => send('/api/chaos', { source: 'race_control' }));
     byId('lane-chaos').onclick = () => report(() => send('/api/chaos', { source: { lane: number('chaos_lane') } }));
     byId('correct').onclick = () => report(() => send('/api/correct-laps', {
@@ -120,6 +144,7 @@
     }));
 
     const events = new EventSource('/api/state/stream');
+    events.onopen = () => allowCurrent = true;
     events.addEventListener('state', event => show(JSON.parse(event.data)));
     events.onerror = () => byId('errors').textContent = 'State stream disconnected; reconnecting…';
   </script>

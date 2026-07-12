@@ -31,6 +31,7 @@ test('control page renders every Rennleiter control and no Advance', async () =>
 	assert.match(body, /<h1[^>]*>Rennleitung<\/h1>/);
 	assert.match(body, /<form/);
 	for (const heading of [
+		'Aktuelles Rennen',
 		'Rennkonfiguration',
 		'Rennsteuerung',
 		'Messereignis simulieren',
@@ -50,6 +51,8 @@ test('control page renders every Rennleiter control and no Advance', async () =>
 	]) {
 		assert.ok(body.includes(button), `missing button ${button}`);
 	}
+	assert.ok(body.includes('Renn-ID:'));
+	assert.ok(!body.includes('Nächstes Rennen'), 'next-race control is terminal-only');
 	for (const label of [
 		'Bahnen',
 		'Fahrer Bahn 1',
