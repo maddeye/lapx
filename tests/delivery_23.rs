@@ -181,7 +181,7 @@ fn driver_assignment_shape_positive_and_unique_are_domain_rules() {
 }
 
 #[test]
-fn exact_ties_follow_lane_finished_append_order() {
+fn exact_ties_follow_canonical_standings() {
     let dir = tempdir().unwrap();
     let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
     let first = store.create_driver("First").unwrap();
@@ -199,14 +199,37 @@ fn exact_ties_follow_lane_finished_append_order() {
     lap(&store, "tie", 1, 110);
 
     let results = &store.completed_races().unwrap()[0].results;
-    assert_eq!(results[0].lane, 2);
-    assert_eq!(results[1].lane, 1);
+    assert_eq!(results[0].lane, 1);
+    assert_eq!(results[1].lane, 2);
     assert_eq!(
         results[0].corrected_laps_thousandths,
         results[1].corrected_laps_thousandths
     );
     assert_eq!(results[0].result_time_ms, results[1].result_time_ms);
-    assert_eq!(store.driver_stats().unwrap()[1].wins, 1);
+    assert_eq!(store.driver_stats().unwrap()[0].wins, 1);
+}
+
+#[test]
+fn history_uses_durable_completion_order_not_race_clock() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
+    let driver = store.create_driver("Ada").unwrap();
+    start(
+        &store,
+        "first-long-race",
+        config(vec![Some(driver.id)], FinishMode::Immediate, 1),
+    );
+    lap(&store, "first-long-race", 1, 1_000);
+    start(
+        &store,
+        "second-short-race",
+        config(vec![Some(driver.id)], FinishMode::Immediate, 1),
+    );
+    lap(&store, "second-short-race", 1, 20);
+
+    let history = store.completed_races().unwrap();
+    assert_eq!(history[0].race_id, "second-short-race");
+    assert_eq!(history[1].race_id, "first-long-race");
 }
 
 #[tokio::test]

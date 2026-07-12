@@ -2,7 +2,7 @@ use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState, RaceStat
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt,
     ops::Deref,
     path::{Path, PathBuf},
@@ -239,8 +239,13 @@ impl SqliteStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
         let race_ids = {
-            let mut statement =
-                transaction.prepare("SELECT DISTINCT race_id FROM race_events ORDER BY race_id")?;
+            let mut statement = transaction.prepare(
+                "SELECT race_id
+                 FROM race_events
+                 GROUP BY race_id
+                 HAVING SUM(event_type = 'race_finished') > 0
+                 ORDER BY MAX(CASE WHEN event_type = 'race_finished' THEN rowid END) DESC",
+            )?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -250,43 +255,19 @@ impl SqliteStore {
             let events = load_events(&transaction, &race_id)?;
             let state = replay(&events)?.state().clone();
             if let RaceStatus::Finished(finished) = &state.status {
-                let finish_order: HashMap<_, _> = events
-                    .iter()
+                let results = state
+                    .standings()
+                    .into_iter()
                     .enumerate()
-                    .filter_map(|(sequence, event)| match event {
-                        Event::LaneFinished { lane, .. } => Some((*lane, sequence)),
-                        _ => None,
+                    .map(|(index, standing)| RaceResult {
+                        position: index as u8 + 1,
+                        lane: standing.lane,
+                        driver_id: finished.config.driver_ids[standing.lane as usize - 1],
+                        corrected_laps_thousandths: standing.corrected_laps_thousandths,
+                        result_time_ms: standing.result_time_ms,
+                        best_lap_ms: state.lane(standing.lane).and_then(|lane| lane.best_lap_ms),
                     })
                     .collect();
-                let mut results: Vec<_> = state
-                    .lanes
-                    .iter()
-                    .map(|lane| RaceResult {
-                        position: 0,
-                        lane: lane.lane,
-                        driver_id: finished.config.driver_ids[lane.lane as usize - 1],
-                        corrected_laps_thousandths: lane.corrected_laps_thousandths,
-                        result_time_ms: lane
-                            .race_time_ms
-                            .map(|time| time.saturating_add(lane.result_time_penalty_ms)),
-                        best_lap_ms: lane.best_lap_ms,
-                    })
-                    .collect();
-                // Exact result ties follow LaneFinished append order in the authoritative protocol.
-                results.sort_by_key(|result| {
-                    (
-                        std::cmp::Reverse(result.corrected_laps_thousandths),
-                        result.result_time_ms.unwrap_or(u64::MAX),
-                        finish_order
-                            .get(&result.lane)
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                        result.lane,
-                    )
-                });
-                for (index, result) in results.iter_mut().enumerate() {
-                    result.position = index as u8 + 1;
-                }
                 races.push(CompletedRace {
                     race_id,
                     official_start_at: finished.official_start_at,
@@ -296,7 +277,6 @@ impl SqliteStore {
             }
         }
         transaction.commit()?;
-        races.sort_by_key(|race| (std::cmp::Reverse(race.finished_at), race.race_id.clone()));
         Ok(races)
     }
 
