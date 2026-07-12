@@ -10,13 +10,14 @@ use crate::{
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{Path, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode, header::HOST, uri::Authority},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, net::IpAddr, sync::Arc};
 
 mod assets;
 
@@ -34,7 +35,12 @@ fn read_router(runtime: Arc<RaceRuntime>) -> Router {
         .with_state(runtime)
 }
 
-/// Full surface for the loopback bind: public reads plus all mutating and debug routes.
+/// Network surface for the loopback listener. HTTP authority is mandatory.
+pub fn local_server_router(runtime: Arc<RaceRuntime>) -> Router {
+    local_router(runtime).layer(middleware::from_fn(require_host))
+}
+
+/// Full in-process surface: public reads plus all mutating and debug routes.
 pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
     Router::new()
         .route("/control", get(assets::control))
@@ -66,6 +72,76 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/hardware", get(hardware))
         .with_state(runtime.clone())
         .merge(read_router(runtime))
+        .layer(middleware::from_fn(require_loopback_host))
+}
+
+async fn require_host(request: Request, next: Next) -> Response {
+    if request.headers().contains_key(HOST) {
+        next.run(request).await
+    } else {
+        StatusCode::MISDIRECTED_REQUEST.into_response()
+    }
+}
+
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    if loopback_request_authority(&request) {
+        next.run(request).await
+    } else {
+        StatusCode::MISDIRECTED_REQUEST.into_response()
+    }
+}
+
+fn loopback_request_authority(request: &Request) -> bool {
+    let Some(host) = single_host(request.headers()) else {
+        return !request.headers().contains_key(HOST);
+    };
+    if !loopback_authority(host) {
+        return false;
+    }
+    request.uri().authority().is_none_or(|authority| {
+        loopback_authority(authority.as_str()) && authority.as_str().eq_ignore_ascii_case(host)
+    })
+}
+
+fn single_host(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(HOST).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn loopback_authority(value: &str) -> bool {
+    if value.contains('@') {
+        return false;
+    }
+    let Ok(authority) = value.parse::<Authority>() else {
+        return false;
+    };
+    if authority.port().is_some_and(|port| {
+        !port.as_str().bytes().all(|byte| byte.is_ascii_digit()) || authority.port_u16().is_none()
+    }) {
+        return false;
+    }
+    let canonical = authority.port().map_or_else(
+        || authority.host().to_owned(),
+        |port| format!("{}:{}", authority.host(), port.as_str()),
+    );
+    if !value.eq_ignore_ascii_case(&canonical) {
+        return false;
+    }
+    let host = authority
+        .host()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or_else(|| authority.host());
+    let host = match host.strip_suffix('.') {
+        Some(host) if !host.ends_with('.') => host,
+        Some(_) => return false,
+        None => host,
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Snapshot plus derived display timing; serializes as a superset of `StateSnapshot`.

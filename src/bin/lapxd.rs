@@ -2,7 +2,7 @@
 use lapx::hardware::gpio::{GpioPowerOutput, GpioTimingSource};
 use lapx::{
     hardware::HardwareConfig,
-    http::{local_router, public_router},
+    http::{local_server_router, public_router},
     runtime::RaceRuntime,
     store::SqliteStore,
 };
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local = TcpListener::bind(local_addr).await?;
     let public = TcpListener::bind(public_addr).await?;
     tokio::try_join!(
-        axum::serve(local, local_router(runtime.clone())),
+        axum::serve(local, local_server_router(runtime.clone())),
         axum::serve(public, public_router(runtime)),
     )?;
     Ok(())
