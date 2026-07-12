@@ -27,6 +27,10 @@ pub(super) async fn control() -> Response {
     page("control.html")
 }
 
+pub(super) async fn admin() -> Response {
+    page("admin.html")
+}
+
 fn page(name: &str) -> Response {
     match UI_BUILD.get_file(name) {
         Some(file) => Html(file.contents()).into_response(),

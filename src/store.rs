@@ -11,6 +11,13 @@ use std::{
 const EVENT_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Driver {
+    pub id: i64,
+    pub display_name: String,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub sequence: u64,
     pub state: RaceState,
@@ -49,6 +56,8 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
     Domain(DomainError),
+    InvalidDriverName,
+    DriverNotFound(i64),
     CorruptProtocol(String),
 }
 
@@ -106,7 +115,12 @@ impl SqliteStore {
             CREATE TRIGGER IF NOT EXISTS race_events_no_update
             BEFORE UPDATE ON race_events BEGIN SELECT RAISE(ABORT, 'race events are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS race_events_no_delete
-            BEFORE DELETE ON race_events BEGIN SELECT RAISE(ABORT, 'race events are append-only'); END;"
+            BEFORE DELETE ON race_events BEGIN SELECT RAISE(ABORT, 'race events are append-only'); END;
+            CREATE TABLE IF NOT EXISTS drivers (
+                id INTEGER PRIMARY KEY,
+                display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
+                archived_at INTEGER
+            );"
         )?;
         Ok(store)
     }
@@ -182,12 +196,82 @@ impl SqliteStore {
         load_events(&connection, race_id)
     }
 
+    pub fn drivers(&self) -> Result<Vec<Driver>, StoreError> {
+        let connection = self.connect()?;
+        let mut statement =
+            connection.prepare("SELECT id, display_name, archived_at FROM drivers ORDER BY id")?;
+        let rows = statement.query_map([], driver_from_row)?;
+        rows.collect::<Result<_, _>>().map_err(StoreError::from)
+    }
+
+    pub fn create_driver(&self, display_name: &str) -> Result<Driver, StoreError> {
+        let display_name = driver_name(display_name)?;
+        let connection = self.connect()?;
+        connection.execute(
+            "INSERT INTO drivers (display_name) VALUES (?1)",
+            [display_name],
+        )?;
+        load_driver(&connection, connection.last_insert_rowid())
+    }
+
+    pub fn rename_driver(&self, id: i64, display_name: &str) -> Result<Driver, StoreError> {
+        let display_name = driver_name(display_name)?;
+        let connection = self.connect()?;
+        if connection.execute(
+            "UPDATE drivers SET display_name = ?1 WHERE id = ?2",
+            params![display_name, id],
+        )? == 0
+        {
+            return Err(StoreError::DriverNotFound(id));
+        }
+        load_driver(&connection, id)
+    }
+
+    pub fn archive_driver(&self, id: i64) -> Result<Driver, StoreError> {
+        let connection = self.connect()?;
+        if connection.execute(
+            "UPDATE drivers SET archived_at = COALESCE(archived_at, unixepoch()) WHERE id = ?1",
+            [id],
+        )? == 0
+        {
+            return Err(StoreError::DriverNotFound(id));
+        }
+        load_driver(&connection, id)
+    }
+
     fn connect(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_millis(50))?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
+}
+
+fn driver_name(display_name: &str) -> Result<&str, StoreError> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        Err(StoreError::InvalidDriverName)
+    } else {
+        Ok(display_name)
+    }
+}
+
+fn driver_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Driver> {
+    Ok(Driver {
+        id: row.get(0)?,
+        display_name: row.get(1)?,
+        archived_at: row.get(2)?,
+    })
+}
+
+fn load_driver(connection: &Connection, id: i64) -> Result<Driver, StoreError> {
+    connection
+        .query_row(
+            "SELECT id, display_name, archived_at FROM drivers WHERE id = ?1",
+            [id],
+            driver_from_row,
+        )
+        .map_err(StoreError::from)
 }
 
 fn replay(events: &[Event]) -> Result<RaceEngine, StoreError> {

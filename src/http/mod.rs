@@ -2,12 +2,12 @@ use crate::{
     domain::{ChaosSource, Command, RaceConfig, SignalEdge},
     hardware::HardwareSnapshot,
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
-    store::StoreError,
+    store::{Driver, StoreError},
 };
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
@@ -35,7 +35,11 @@ fn read_router(runtime: Arc<RaceRuntime>) -> Router {
 pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
     Router::new()
         .route("/control", get(assets::control))
+        .route("/admin", get(assets::admin))
         .route("/_app/{*path}", get(assets::app_asset))
+        .route("/api/drivers", get(drivers).post(create_driver))
+        .route("/api/drivers/{id}/rename", post(rename_driver))
+        .route("/api/drivers/{id}/archive", post(archive_driver))
         .route("/api/hardware", get(hardware_state))
         .route("/api/start", post(start))
         .route("/api/sensor", post(sensor))
@@ -90,6 +94,58 @@ struct ChaosInput {
 struct CorrectionInput {
     lane: u8,
     delta_thousandths: i64,
+}
+
+#[derive(Deserialize)]
+struct DriverNameInput {
+    display_name: String,
+}
+
+async fn drivers(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<Vec<Driver>>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.drivers()).await?))
+}
+
+async fn create_driver(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<DriverNameInput>, JsonRejection>,
+) -> Result<Json<Driver>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || store.create_driver(&input.display_name)).await?,
+    ))
+}
+
+async fn rename_driver(
+    State(runtime): State<Arc<RaceRuntime>>,
+    Path(id): Path<i64>,
+    input: Result<Json<DriverNameInput>, JsonRejection>,
+) -> Result<Json<Driver>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || store.rename_driver(id, &input.display_name)).await?,
+    ))
+}
+
+async fn archive_driver(
+    State(runtime): State<Arc<RaceRuntime>>,
+    Path(id): Path<i64>,
+    input: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Result<Json<Driver>, HttpError> {
+    parse(input)?;
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.archive_driver(id)).await?))
+}
+
+async fn store_task<T: Send + 'static>(
+    task: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, HttpError> {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(RuntimeError::from)?
+        .map_err(HttpError::Store)
 }
 
 async fn state(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
@@ -241,6 +297,7 @@ async fn hardware() -> Html<&'static str> {
 enum HttpError {
     Malformed(String),
     HardwareUnavailable,
+    Store(StoreError),
     Runtime(RuntimeError),
 }
 
@@ -264,10 +321,13 @@ impl IntoResponse for HttpError {
         }
         let status = match &self {
             Self::Malformed(_)
+            | Self::Store(StoreError::InvalidDriverName)
             | Self::Runtime(RuntimeError::Store(StoreError::Domain(_)))
             | Self::Runtime(RuntimeError::HardwareLaneMismatch { .. }) => StatusCode::BAD_REQUEST,
-            Self::HardwareUnavailable => StatusCode::NOT_FOUND,
-            Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
+            Self::HardwareUnavailable | Self::Store(StoreError::DriverNotFound(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            Self::Store(error) | Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -276,6 +336,9 @@ impl IntoResponse for HttpError {
             Self::Malformed(message) => message.clone(),
             Self::Runtime(error) => error.to_string(),
             Self::HardwareUnavailable => "hardware is not configured".into(),
+            Self::Store(StoreError::InvalidDriverName) => "display_name must not be blank".into(),
+            Self::Store(StoreError::DriverNotFound(id)) => format!("driver {id} not found"),
+            Self::Store(error) => error.to_string(),
         };
         (status, message).into_response()
     }
