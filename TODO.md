@@ -124,7 +124,7 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
   - Assign Fahrer through race events and derive corrected history, starts, wins, and best laps from Rennprotokolle.
   - Verify: `cargo test driver_stats_from_completed_race correction_updates_driver_stats`.
 
-- [ ] **Delivery 24 — [Manual tournament heat list](.plans/best-path/slice-25.html)**
+- [x] **Delivery 24 — [Manual tournament heat list](.plans/best-path/slice-25.html)**
   - Add tournaments, ordered heats, lane assignments, and links to authoritative race ids.
   - Verify: `cargo test manual_tournament_flow`.
 

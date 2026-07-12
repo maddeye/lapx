@@ -2,7 +2,7 @@ use crate::{
     domain::{ChaosSource, Command, RaceConfig, SignalEdge},
     hardware::HardwareSnapshot,
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
-    store::{CompletedRace, Driver, DriverStats, StoreError},
+    store::{CompletedRace, Driver, DriverStats, HeatAssignment, StoreError, Tournament},
 };
 use async_stream::stream;
 use axum::{
@@ -40,6 +40,13 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/drivers", get(drivers).post(create_driver))
         .route("/api/race-history", get(race_history))
         .route("/api/driver-stats", get(driver_stats))
+        .route("/api/tournaments", get(tournaments).post(create_tournament))
+        .route("/api/tournaments/{id}", get(tournament))
+        .route("/api/tournaments/{id}/heats", post(append_heat))
+        .route(
+            "/api/tournaments/{id}/heats/{heat_id}/link",
+            post(link_heat),
+        )
         .route("/api/drivers/{id}/rename", post(rename_driver))
         .route("/api/drivers/{id}/archive", post(archive_driver))
         .route("/api/hardware", get(hardware_state))
@@ -103,6 +110,21 @@ struct DriverNameInput {
     display_name: String,
 }
 
+#[derive(Deserialize)]
+struct TournamentNameInput {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct HeatInput {
+    assignments: Vec<HeatAssignment>,
+}
+
+#[derive(Deserialize)]
+struct LinkHeatInput {
+    race_id: String,
+}
+
 async fn drivers(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<Vec<Driver>>, HttpError> {
     let store = runtime.store();
     Ok(Json(store_task(move || store.drivers()).await?))
@@ -120,6 +142,56 @@ async fn driver_stats(
 ) -> Result<Json<Vec<DriverStats>>, HttpError> {
     let store = runtime.store();
     Ok(Json(store_task(move || store.driver_stats()).await?))
+}
+
+async fn tournaments(
+    State(runtime): State<Arc<RaceRuntime>>,
+) -> Result<Json<Vec<Tournament>>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.tournaments()).await?))
+}
+
+async fn tournament(
+    State(runtime): State<Arc<RaceRuntime>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Tournament>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.tournament(id)).await?))
+}
+
+async fn create_tournament(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<TournamentNameInput>, JsonRejection>,
+) -> Result<Json<Tournament>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || store.create_tournament(&input.name)).await?,
+    ))
+}
+
+async fn append_heat(
+    State(runtime): State<Arc<RaceRuntime>>,
+    Path(id): Path<i64>,
+    input: Result<Json<HeatInput>, JsonRejection>,
+) -> Result<Json<Tournament>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || store.append_heat(id, &input.assignments)).await?,
+    ))
+}
+
+async fn link_heat(
+    State(runtime): State<Arc<RaceRuntime>>,
+    Path((id, heat_id)): Path<(i64, i64)>,
+    input: Result<Json<LinkHeatInput>, JsonRejection>,
+) -> Result<Json<Tournament>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || store.link_heat(id, heat_id, &input.race_id)).await?,
+    ))
 }
 
 async fn create_driver(
@@ -337,14 +409,29 @@ impl IntoResponse for HttpError {
         }
         let status = match &self {
             Self::Malformed(_)
-            | Self::Store(StoreError::InvalidDriverName | StoreError::DriverNotActive(_))
+            | Self::Store(
+                StoreError::InvalidDriverName
+                | StoreError::DriverNotActive(_)
+                | StoreError::InvalidTournamentName
+                | StoreError::InvalidHeatAssignments
+                | StoreError::RaceAssignmentsMismatch,
+            )
             | Self::Runtime(RuntimeError::Store(
                 StoreError::Domain(_) | StoreError::DriverNotActive(_),
             ))
             | Self::Runtime(RuntimeError::HardwareLaneMismatch { .. }) => StatusCode::BAD_REQUEST,
-            Self::HardwareUnavailable | Self::Store(StoreError::DriverNotFound(_)) => {
-                StatusCode::NOT_FOUND
-            }
+            Self::HardwareUnavailable
+            | Self::Store(
+                StoreError::DriverNotFound(_)
+                | StoreError::TournamentNotFound(_)
+                | StoreError::HeatNotFound(_)
+                | StoreError::RaceNotFound(_),
+            ) => StatusCode::NOT_FOUND,
+            Self::Store(
+                StoreError::TournamentFrozen(_)
+                | StoreError::HeatAlreadyLinked(_)
+                | StoreError::RaceAlreadyLinked(_),
+            ) => StatusCode::CONFLICT,
             Self::Store(error) | Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -360,6 +447,27 @@ impl IntoResponse for HttpError {
             Self::HardwareUnavailable => "hardware is not configured".into(),
             Self::Store(StoreError::InvalidDriverName) => "display_name must not be blank".into(),
             Self::Store(StoreError::DriverNotFound(id)) => format!("driver {id} not found"),
+            Self::Store(StoreError::InvalidTournamentName) => "name must not be blank".into(),
+            Self::Store(StoreError::TournamentNotFound(id)) => {
+                format!("tournament {id} not found")
+            }
+            Self::Store(StoreError::HeatNotFound(id)) => format!("heat {id} not found"),
+            Self::Store(StoreError::InvalidHeatAssignments) => {
+                "assign lanes 1 through 4 once, with a different active driver per lane".into()
+            }
+            Self::Store(StoreError::TournamentFrozen(id)) => {
+                format!("tournament {id} is frozen because a linked heat has started")
+            }
+            Self::Store(StoreError::HeatAlreadyLinked(id)) => {
+                format!("heat {id} is already linked")
+            }
+            Self::Store(StoreError::RaceNotFound(id)) => format!("race {id} not found"),
+            Self::Store(StoreError::RaceAlreadyLinked(id)) => {
+                format!("race {id} is already linked")
+            }
+            Self::Store(StoreError::RaceAssignmentsMismatch) => {
+                "race Fahrer/lane assignments do not match the heat".into()
+            }
             Self::Store(error) => error.to_string(),
         };
         (status, message).into_response()

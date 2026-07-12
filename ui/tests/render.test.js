@@ -68,9 +68,22 @@ test('control page renders every Rennleiter control and no Advance', async () =>
 	assert.ok(body.includes('Aktuelle Runde'));
 });
 
-test('admin page renders Fahrer create, rename, archive controls', async () => {
+test('admin page renders Fahrer and flat tournament controls', async () => {
+	const tournament = {
+		id: 3,
+		name: 'Sommer-Cup',
+		heats: [{
+			id: 9,
+			position: 1,
+			assignments: [{ lane: 1, driver_id: 7 }],
+			race_id: null,
+			results: null
+		}]
+	};
 	const body = await renderPage('/src/routes/admin/+page.svelte', {
-		initialDrivers: [{ id: 7, display_name: 'Ada', archived_at: null }]
+		initialDrivers: [{ id: 7, display_name: 'Ada', archived_at: null }],
+		initialTournaments: [tournament],
+		initialSelectedTournament: tournament
 	});
 	assert.match(body, /<h1[^>]*>Fahrer<\/h1>/);
 	for (const text of [
@@ -81,6 +94,12 @@ test('admin page renders Fahrer create, rename, archive controls', async () => {
 		'Ada',
 		'Umbenennen',
 		'Archivieren',
+		'Turniere',
+		'Turniername',
+		'Turnier anlegen',
+		'Sommer-Cup',
+		'Lauf anhängen',
+		'Rennen einmalig verknüpfen',
 		'Fahrerstatistik',
 		'Rennhistorie'
 	]) {
@@ -88,6 +107,9 @@ test('admin page renders Fahrer create, rename, archive controls', async () => {
 	}
 	assert.ok(body.includes('<form'));
 	assert.ok(!body.includes('Löschen'), 'admin must not expose hard delete');
+	for (const forbidden of ['Turnierstand', 'Turniersieger', 'Bracket']) {
+		assert.ok(!body.includes(forbidden), `admin must not expose ${forbidden}`);
+	}
 });
 
 test('rennscreen renders the public display without controls', async () => {
