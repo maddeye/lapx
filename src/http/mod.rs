@@ -109,10 +109,28 @@ fn single_host(headers: &HeaderMap) -> Option<&str> {
     values.next().is_none().then_some(value)
 }
 
-fn loopback_authority(authority: &str) -> bool {
-    let Some(host) = parse_host(authority) else {
+fn loopback_authority(value: &str) -> bool {
+    if value.contains('@') {
+        return false;
+    }
+    let Ok(authority) = value.parse::<Authority>() else {
         return false;
     };
+    if authority.port().is_some() && authority.port_u16().is_none() {
+        return false;
+    }
+    let canonical = authority.port().map_or_else(
+        || authority.host().to_owned(),
+        |port| format!("{}:{}", authority.host(), port.as_str()),
+    );
+    if !value.eq_ignore_ascii_case(&canonical) {
+        return false;
+    }
+    let host = authority
+        .host()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or_else(|| authority.host());
     let host = match host.strip_suffix('.') {
         Some(host) if !host.ends_with('.') => host,
         Some(_) => return false,
@@ -122,33 +140,6 @@ fn loopback_authority(authority: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-fn parse_host(authority: &str) -> Option<&str> {
-    authority.parse::<Authority>().ok()?;
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        let close = bracketed.find(']')?;
-        let (host, suffix) = bracketed.split_at(close);
-        valid_port(suffix.strip_prefix(']')?).then_some(host)
-    } else {
-        match authority.split_once(':') {
-            Some((host, port)) if !host.is_empty() && valid_port(&format!(":{port}")) => Some(host),
-            Some(_) => None,
-            None => Some(authority),
-        }
-    }
-}
-
-fn valid_port(suffix: &str) -> bool {
-    suffix.is_empty()
-        || suffix
-            .strip_prefix(':')
-            .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|port| port.parse::<u16>().ok())
-            .is_some()
 }
 
 /// Snapshot plus derived display timing; serializes as a superset of `StateSnapshot`.
