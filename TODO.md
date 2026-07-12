@@ -138,12 +138,12 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Final acceptance
 
-- [ ] A complete simulated race works through `lapxctl`, HTTP, Debug-Bedienung, and Rennleiter UI.
+- [x] A complete simulated race works through `lapxctl`, HTTP, Debug-Bedienung, and Rennleiter UI.
 - [ ] A complete physical race works on Raspberry Pi with four Messstellen and four relay outputs.
-- [ ] Power loss/restart reconstructs committed state, leaves lanes unpowered, and requires Wiederanlaufsequenz.
-- [ ] Public clients can observe a live race but cannot invoke commands or load local control/debug pages.
-- [ ] Post-race Rundenkorrektur updates history, statistics, tournament results, and all later Elo values.
-- [ ] The same tournament mode, Fahrer set, and seed always generate identical heats.
+- [x] Power loss/restart reconstructs committed state, leaves lanes unpowered, and requires Wiederanlaufsequenz.
+- [x] Public clients can observe a live race but cannot invoke commands or load local control/debug pages.
+- [x] Post-race Rundenkorrektur updates history, statistics, tournament results, and all later Elo values.
+- [x] The same tournament mode, Fahrer set, and seed always generate identical heats.
 - [ ] All repository tests and hardware checks pass with no unchecked delivery or acceptance item above.
 
 Detailed overview: [.plans/best-path/index.html](.plans/best-path/index.html)
