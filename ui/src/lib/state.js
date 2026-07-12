@@ -2,14 +2,13 @@
 // Injected globals keep this testable under node:test.
 
 /**
- * Single arbiter for server state: owns the sequence cursor, snapshot
+ * Single arbiter for server state: owns the generation/sequence cursor, snapshot
  * acceptance, connection status, and the monotonic receive timestamp.
  * All snapshot sources (initial fetch, SSE, POST responses) go through
  * accept(); nothing assigns snapshots directly.
  */
 export function createStateClient(onChange, deps = {}) {
 	const now = deps.now ?? (() => performance.now());
-	let sequence = -1;
 	let snapshot = null;
 	let connection = 'verbinde …';
 	let receivedAt = 0;
@@ -22,11 +21,22 @@ export function createStateClient(onChange, deps = {}) {
 		now,
 		accept(state, refresh = false) {
 			if (
-				typeof state?.sequence !== 'number' ||
-				state.sequence < sequence ||
-				(state.sequence === sequence && !refresh)
+				typeof state?.race_id !== 'string' ||
+				!state.race_id ||
+				!Number.isSafeInteger(state.race_generation) ||
+				state.race_generation < 0 ||
+				!Number.isSafeInteger(state.sequence) ||
+				state.sequence < 0
 			) return false;
-			sequence = state.sequence;
+			if (snapshot) {
+				if (state.race_generation < snapshot.race_generation) return false;
+				if (
+					state.race_generation === snapshot.race_generation &&
+					(state.race_id !== snapshot.race_id ||
+						state.sequence < snapshot.sequence ||
+						(state.sequence === snapshot.sequence && !refresh))
+				) return false;
+			}
 			snapshot = state;
 			receivedAt = now();
 			emit();

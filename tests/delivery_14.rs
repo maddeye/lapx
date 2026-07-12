@@ -128,8 +128,10 @@ async fn debug_page_exposes_every_race_config_value() {
     ] {
         assert!(page.contains(value), "missing {value}");
     }
-    assert!(page.contains("snapshot.sequence <= sequence"));
-    assert!(page.contains("sequence = snapshot.sequence"));
+    assert!(page.contains("snapshot.race_generation < current.race_generation"));
+    assert!(page.contains("snapshot.race_generation === current.race_generation"));
+    assert!(page.contains("snapshot.sequence === current.sequence"));
+    assert!(page.contains("current = snapshot"));
 }
 
 #[tokio::test(start_paused = true)]

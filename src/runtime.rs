@@ -12,10 +12,7 @@ use crate::{
 use dispatcher::{Dispatcher, DispatcherHardware, needs_pause};
 use std::{
     fmt,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tokio::{
@@ -143,7 +140,7 @@ fn duration_millis(duration: Duration) -> Result<u64, RuntimeError> {
 
 struct Shared {
     updates: broadcast::Sender<StateSnapshot>,
-    published_sequence: AtomicU64,
+    published: StdMutex<StateSnapshot>,
     clock: StdMutex<ProtocolClock>,
 }
 
@@ -168,13 +165,9 @@ impl Shared {
         {
             clock.observe(at);
         }
-        if self
-            .published_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
-                (snapshot.sequence > sequence).then_some(snapshot.sequence)
-            })
-            .is_ok()
-        {
+        let mut published = self.published.lock().expect("publication lock poisoned");
+        if snapshot.follows(&published) {
+            *published = snapshot.clone();
             let _ = self.updates.send(snapshot.clone());
         }
     }
@@ -212,6 +205,11 @@ enum Ingress {
     Snapshot {
         response: oneshot::Sender<CommandResult>,
     },
+    SwitchRace {
+        expected_race_id: String,
+        next_race_id: String,
+        response: oneshot::Sender<CommandResult>,
+    },
 }
 
 impl RaceRuntime {
@@ -219,8 +217,9 @@ impl RaceRuntime {
         store: SqliteStore,
         race_id: impl Into<String>,
     ) -> Result<Arc<Self>, RuntimeError> {
-        let race_id = race_id.into();
-        let initial = load_snapshot(&store, &race_id).await?;
+        let fallback_race_id = race_id.into();
+        let initial = initialize_current_race(&store, &fallback_race_id).await?;
+        let race_id = initial.race_id.clone();
         let (ingress, receiver) = mpsc::unbounded_channel();
         let shared = shared(&initial, false)?;
         let runtime = Arc::new(Self {
@@ -244,9 +243,10 @@ impl RaceRuntime {
         T: TimingSource + 'static,
         P: PowerOutput + 'static,
     {
-        let race_id = race_id.into();
+        let fallback_race_id = race_id.into();
         power.set_lane_power([false; 4])?;
-        let mut initial = load_snapshot(&store, &race_id).await?;
+        let mut initial = initialize_current_race(&store, &fallback_race_id).await?;
+        let race_id = initial.race_id.clone();
         validate_hardware_snapshot(&initial, &config)?;
         if needs_pause(&initial) {
             initial = execute_now(
@@ -333,6 +333,22 @@ impl RaceRuntime {
         self.request(CommandRequest::Exact(command)).await
     }
 
+    pub async fn next_race(
+        &self,
+        expected_race_id: impl Into<String>,
+        next_race_id: impl Into<String>,
+    ) -> Result<StateSnapshot, RuntimeError> {
+        let (response, receive) = oneshot::channel();
+        self.ingress
+            .send(Ingress::SwitchRace {
+                expected_race_id: expected_race_id.into(),
+                next_race_id: next_race_id.into(),
+                response,
+            })
+            .map_err(|_| RuntimeError::DispatcherStopped)?;
+        receive.await.map_err(|_| RuntimeError::DispatcherStopped)?
+    }
+
     pub async fn apply_now<F>(&self, command: F) -> Result<StateSnapshot, RuntimeError>
     where
         F: FnOnce(ProtocolMillis) -> Command + Send + 'static,
@@ -359,7 +375,7 @@ fn shared(initial: &StateSnapshot, hardware: bool) -> Result<Arc<Shared>, Runtim
     let (updates, _) = broadcast::channel(16);
     Ok(Arc::new(Shared {
         updates,
-        published_sequence: AtomicU64::new(initial.sequence),
+        published: StdMutex::new(initial.clone()),
         clock: StdMutex::new(ProtocolClock {
             protocol_at_anchor: initial.state.last_event_at.unwrap_or(0),
             instant_anchor: Instant::now(),
@@ -424,6 +440,18 @@ fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
 #[cfg(not(feature = "gpio"))]
 fn kernel_monotonic_now() -> Result<Option<Duration>, RuntimeError> {
     Ok(None)
+}
+
+async fn initialize_current_race(
+    store: &SqliteStore,
+    fallback_race_id: &str,
+) -> Result<StateSnapshot, RuntimeError> {
+    let store = store.clone();
+    let fallback_race_id = fallback_race_id.to_owned();
+    Ok(
+        tokio::task::spawn_blocking(move || store.initialize_current_race(&fallback_race_id))
+            .await??,
+    )
 }
 
 async fn load_snapshot(store: &SqliteStore, race_id: &str) -> Result<StateSnapshot, RuntimeError> {

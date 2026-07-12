@@ -56,6 +56,7 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/drivers/{id}/archive", post(archive_driver))
         .route("/api/hardware", get(hardware_state))
         .route("/api/start", post(start))
+        .route("/api/next-race", post(next_race))
         .route("/api/sensor", post(sensor))
         .route("/api/pause", post(pause))
         .route("/api/resume", post(resume))
@@ -92,6 +93,16 @@ fn http_state(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<HttpStat
 struct StartInput {
     config: RaceConfig,
 }
+
+#[derive(Deserialize)]
+struct NextRaceInput {
+    expected_race_id: String,
+    next_race_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyInput {}
 
 #[derive(Deserialize)]
 struct SensorInput {
@@ -317,6 +328,17 @@ async fn start(
     Ok(Json(http_state(&runtime, snapshot)?))
 }
 
+async fn next_race(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<NextRaceInput>, JsonRejection>,
+) -> Result<Json<HttpState>, HttpError> {
+    let input = parse(input)?;
+    let snapshot = runtime
+        .next_race(input.expected_race_id, input.next_race_id)
+        .await?;
+    Ok(Json(http_state(&runtime, snapshot)?))
+}
+
 async fn sensor(
     State(runtime): State<Arc<RaceRuntime>>,
     input: Result<Json<SensorInput>, JsonRejection>,
@@ -332,12 +354,20 @@ async fn sensor(
     Ok(Json(http_state(&runtime, snapshot)?))
 }
 
-async fn pause(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
+async fn pause(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<EmptyInput>, JsonRejection>,
+) -> Result<Json<HttpState>, HttpError> {
+    parse(input)?;
     let snapshot = runtime.apply_now(|at| Command::PauseRace { at }).await?;
     Ok(Json(http_state(&runtime, snapshot)?))
 }
 
-async fn resume(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<HttpState>, HttpError> {
+async fn resume(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<EmptyInput>, JsonRejection>,
+) -> Result<Json<HttpState>, HttpError> {
+    parse(input)?;
     let snapshot = runtime.apply_now(|at| Command::ResumeRace { at }).await?;
     Ok(Json(http_state(&runtime, snapshot)?))
 }
@@ -376,10 +406,10 @@ async fn state_stream(
 ) -> Result<impl IntoResponse, HttpError> {
     let mut receiver = runtime.subscribe();
     let initial = runtime.snapshot().await?;
-    let initial = state_event(&runtime, initial)?;
+    let initial_event = state_event(&runtime, initial.clone())?;
     let states = stream! {
-        let mut sequence = initial.1;
-        yield Ok::<_, Infallible>(initial.0);
+        let mut cursor = initial;
+        yield Ok::<_, Infallible>(initial_event);
         loop {
             let snapshot = match receiver.recv().await {
                 Ok(snapshot) => snapshot,
@@ -391,11 +421,11 @@ async fn state_stream(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            if snapshot.sequence > sequence {
-                sequence = snapshot.sequence;
+            if snapshot.follows(&cursor) {
+                cursor = snapshot.clone();
                 // Clock failure ends the stream; the client reconnects.
                 match state_event(&runtime, snapshot) {
-                    Ok((event, _)) => yield Ok(event),
+                    Ok(event) => yield Ok(event),
                     Err(_) => break,
                 }
             }
@@ -410,16 +440,18 @@ fn parse<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
         .map_err(|error| HttpError::Malformed(error.to_string()))
 }
 
-fn state_event(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<(Event, u64), HttpError> {
-    let sequence = snapshot.sequence;
+fn state_event(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<Event, HttpError> {
     let event = Event::default()
         .event("state")
-        .id(sequence.to_string())
+        .id(format!(
+            "{}:{}",
+            snapshot.race_generation, snapshot.sequence
+        ))
         .data(
             serde_json::to_string(&http_state(runtime, snapshot)?)
                 .expect("state snapshot is serializable"),
         );
-    Ok((event, sequence))
+    Ok(event)
 }
 
 async fn debug() -> Html<&'static str> {
@@ -464,10 +496,11 @@ impl IntoResponse for HttpError {
                 | StoreError::InvalidTournamentName
                 | StoreError::InvalidTournamentGeneration
                 | StoreError::InvalidHeatAssignments
-                | StoreError::RaceAssignmentsMismatch,
+                | StoreError::RaceAssignmentsMismatch
+                | StoreError::InvalidRaceId,
             )
             | Self::Runtime(RuntimeError::Store(
-                StoreError::Domain(_) | StoreError::DriverNotActive(_),
+                StoreError::Domain(_) | StoreError::DriverNotActive(_) | StoreError::InvalidRaceId,
             ))
             | Self::Runtime(RuntimeError::HardwareLaneMismatch { .. }) => StatusCode::BAD_REQUEST,
             Self::HardwareUnavailable
@@ -480,8 +513,16 @@ impl IntoResponse for HttpError {
             Self::Store(
                 StoreError::TournamentFrozen(_)
                 | StoreError::HeatAlreadyLinked(_)
-                | StoreError::RaceAlreadyLinked(_),
-            ) => StatusCode::CONFLICT,
+                | StoreError::RaceAlreadyLinked(_)
+                | StoreError::CurrentRaceConflict { .. }
+                | StoreError::RaceNotTerminal(_)
+                | StoreError::RaceAlreadyExists(_),
+            )
+            | Self::Runtime(RuntimeError::Store(
+                StoreError::CurrentRaceConflict { .. }
+                | StoreError::RaceNotTerminal(_)
+                | StoreError::RaceAlreadyExists(_),
+            )) => StatusCode::CONFLICT,
             Self::Store(error) | Self::Runtime(RuntimeError::Store(error)) if error.is_busy() => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -493,7 +534,6 @@ impl IntoResponse for HttpError {
             | Self::Runtime(RuntimeError::Store(StoreError::DriverNotActive(id))) => {
                 format!("driver {id} is missing or archived")
             }
-            Self::Runtime(error) => error.to_string(),
             Self::HardwareUnavailable => "hardware is not configured".into(),
             Self::Store(StoreError::InvalidDriverName) => "display_name must not be blank".into(),
             Self::Store(StoreError::DriverNotFound(id)) => format!("driver {id} not found"),
@@ -521,7 +561,25 @@ impl IntoResponse for HttpError {
             Self::Store(StoreError::RaceAssignmentsMismatch) => {
                 "race Fahrer/lane assignments do not match the heat".into()
             }
+            Self::Store(StoreError::InvalidRaceId)
+            | Self::Runtime(RuntimeError::Store(StoreError::InvalidRaceId)) => {
+                "next_race_id must not be blank".into()
+            }
+            Self::Store(StoreError::CurrentRaceConflict { expected, actual })
+            | Self::Runtime(RuntimeError::Store(StoreError::CurrentRaceConflict {
+                expected,
+                actual,
+            })) => format!("current race is {actual}, not expected {expected}"),
+            Self::Store(StoreError::RaceNotTerminal(id))
+            | Self::Runtime(RuntimeError::Store(StoreError::RaceNotTerminal(id))) => {
+                format!("race {id} is not finished or aborted")
+            }
+            Self::Store(StoreError::RaceAlreadyExists(id))
+            | Self::Runtime(RuntimeError::Store(StoreError::RaceAlreadyExists(id))) => {
+                format!("race {id} already exists")
+            }
             Self::Store(error) => error.to_string(),
+            Self::Runtime(error) => error.to_string(),
         };
         (status, message).into_response()
     }

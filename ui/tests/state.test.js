@@ -13,6 +13,7 @@ import {
 } from '../src/lib/state.js';
 import {
 	startPayload,
+	nextRacePayload,
 	sensorPayload,
 	raceChaosPayload,
 	laneChaosPayload,
@@ -46,6 +47,7 @@ const jsonResponse = (body, ok = true, status = 200) => ({
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+const raceState = (sequence, fields = {}) => ({ race_id: 'race', race_generation: 0, sequence, state: {}, ...fields });
 
 function client(states = [], statuses = []) {
 	return createStateClient(
@@ -61,20 +63,20 @@ test('client delivers initial fetch and strictly increasing stream states', asyn
 	const seen = [];
 	const arbiter = createStateClient((next) => seen.push(next.snapshot?.sequence ?? null));
 	const { stop } = connectState(arbiter, {
-		fetch: async () => jsonResponse({ sequence: 1, state: {} }),
+		fetch: async () => jsonResponse(raceState(1)),
 		EventSource: FakeEventSource
 	});
 	const source = FakeEventSource.last;
 	await settle();
-	source.emit('state', { sequence: 1, state: {} }); // duplicate: dropped
-	source.emit('state', { sequence: 3, state: {} });
-	source.emit('state', { sequence: 2, state: {} }); // stale: dropped
-	source.emit('state', { sequence: 4, state: {} });
+	source.emit('state', raceState(1)); // duplicate: dropped
+	source.emit('state', raceState(3));
+	source.emit('state', raceState(2)); // stale: dropped
+	source.emit('state', raceState(4));
 	const sequences = seen.filter((sequence) => sequence !== null);
 	assert.deepEqual([...new Set(sequences)], [1, 3, 4]);
 	stop();
 	assert.equal(source.closed, true);
-	source.emit('state', { sequence: 9, state: {} });
+	source.emit('state', raceState(9));
 	assert.deepEqual([...new Set(seen.filter((sequence) => sequence !== null))], [1, 3, 4]);
 });
 
@@ -82,11 +84,11 @@ test('same-sequence SSE refresh re-anchors volatile clocks after reconnect', () 
 	let now = 100;
 	let latest = null;
 	const arbiter = createStateClient((next) => (latest = next), { now: () => now });
-	assert.equal(arbiter.accept({ sequence: 4, protocol_now: 1_000, state: {} }), true);
+	assert.equal(arbiter.accept(raceState(4, { protocol_now: 1_000 })), true);
 	now = 500;
-	assert.equal(arbiter.accept({ sequence: 4, protocol_now: 1_000, state: {} }), false);
+	assert.equal(arbiter.accept(raceState(4, { protocol_now: 1_000 })), false);
 	assert.equal(latest.receivedAt, 100);
-	assert.equal(arbiter.accept({ sequence: 4, protocol_now: 1_000, state: {} }, true), true);
+	assert.equal(arbiter.accept(raceState(4, { protocol_now: 1_000 }), true), true);
 	assert.equal(latest.receivedAt, 500);
 });
 
@@ -100,9 +102,9 @@ test('delayed same-sequence SSE cannot regress a newer fetch envelope', async ()
 	});
 	const source = FakeEventSource.last;
 	source.onopen();
-	resolveFetch(jsonResponse({ sequence: 7, protocol_now: 2_000, state: {} }));
+	resolveFetch(jsonResponse(raceState(7, { protocol_now: 2_000 })));
 	await settle();
-	source.emit('state', { sequence: 7, protocol_now: 1_000, state: {} });
+	source.emit('state', raceState(7, { protocol_now: 1_000 }));
 	assert.equal(latest.snapshot.protocol_now, 2_000);
 });
 
@@ -110,14 +112,14 @@ test('POST after reconnect consumes refresh before delayed same-sequence SSE', a
 	let latest = null;
 	const arbiter = createStateClient((next) => (latest = next));
 	const stream = connectState(arbiter, {
-		fetch: async () => jsonResponse({ sequence: 7, protocol_now: 1_000, state: {} }),
+		fetch: async () => jsonResponse(raceState(7, { protocol_now: 1_000 })),
 		EventSource: FakeEventSource
 	});
 	await settle();
 	const source = FakeEventSource.last;
 	source.onopen(); // reconnect grants one same-sequence refresh
-	stream.accept({ sequence: 8, protocol_now: 2_000, state: {} });
-	source.emit('state', { sequence: 8, protocol_now: 1_500, state: {} });
+	stream.accept(raceState(8, { protocol_now: 2_000 }));
+	source.emit('state', raceState(8, { protocol_now: 1_500 }));
 	assert.equal(latest.snapshot.protocol_now, 2_000);
 });
 
@@ -131,7 +133,7 @@ test('fetch failure after a successful SSE does not overwrite connected status',
 		EventSource: FakeEventSource
 	});
 	const source = FakeEventSource.last;
-	source.emit('state', { sequence: 1, state: {} }); // SSE connects first
+	source.emit('state', raceState(1)); // SSE connects first
 	assert.equal(latest.connection, 'verbunden');
 	assert.equal(latest.connected, true);
 	failFetch(new Error('late failure'));
@@ -158,23 +160,70 @@ test('POST results feed the same arbiter: stale responses are dropped', async ()
 	const seen = [];
 	const arbiter = createStateClient((next) => seen.push(next.snapshot.sequence));
 	const { accept } = connectState(arbiter, {
-		fetch: async () => jsonResponse({ sequence: 5, state: {} }),
+		fetch: async () => jsonResponse(raceState(5)),
 		EventSource: FakeEventSource
 	});
 	await settle();
-	assert.equal(accept({ sequence: 4, state: {} }), false); // stale POST result
-	assert.equal(accept({ sequence: 6, state: {} }), true);
+	assert.equal(accept(raceState(4)), false); // stale POST result
+	assert.equal(accept(raceState(6)), true);
 	assert.deepEqual(seen, [5, 6]);
+});
+
+test('generation orders race switches without terminal or ready boundary heuristics', () => {
+	const seen = [];
+	const arbiter = createStateClient((next) =>
+		seen.push(`${next.snapshot.race_generation}:${next.snapshot.race_id}:${next.snapshot.sequence}`)
+	);
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 4, sequence: 8, state: { status: 'active' } }), true);
+	assert.equal(arbiter.accept({ race_id: 'new', race_generation: 5, sequence: 3, state: { status: 'active' } }), true);
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 4, sequence: 99, state: { status: 'finished' } }, true), false);
+	assert.equal(arbiter.accept({ race_id: 'wrong', race_generation: 5, sequence: 4, state: {} }), false);
+	assert.equal(arbiter.accept({ race_id: 'new', race_generation: 5, sequence: 4, state: {} }), true);
+	// A greater generation is authoritative even if its race ID was seen before.
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 6, sequence: 0, state: { status: 'ready' } }), true);
+	assert.deepEqual(seen, ['4:old:8', '5:new:3', '5:new:4', '6:old:0']);
+});
+
+test('reconnect accepts a greater generation after the switch boundary was missed', async () => {
+	let latest = null;
+	const arbiter = createStateClient((next) => (latest = next));
+	connectState(arbiter, {
+		fetch: async () =>
+			jsonResponse({ race_id: 'old', race_generation: 7, sequence: 8, state: { status: 'active' } }),
+		EventSource: FakeEventSource
+	});
+	await settle();
+	const source = FakeEventSource.last;
+	source.onopen();
+	source.emit('state', { race_id: 'new', race_generation: 8, sequence: 3, state: { status: 'active' } });
+	assert.equal(latest.snapshot.race_id, 'new');
+	assert.equal(latest.snapshot.race_generation, 8);
+});
+
+test('delayed lower-generation fetch and POST responses cannot regress state', async () => {
+	let latest = null;
+	let resolveFetch;
+	const arbiter = createStateClient((next) => (latest = next));
+	const stream = connectState(arbiter, {
+		fetch: () => new Promise((resolve) => (resolveFetch = resolve)),
+		EventSource: FakeEventSource
+	});
+	FakeEventSource.last.emit('state', { race_id: 'new', race_generation: 2, sequence: 1, state: {} });
+	assert.equal(stream.accept({ race_id: 'old', race_generation: 1, sequence: 100, state: {} }), false);
+	resolveFetch(jsonResponse({ race_id: 'old', race_generation: 1, sequence: 100, state: {} }));
+	await settle();
+	assert.equal(latest.snapshot.race_id, 'new');
+	assert.equal(latest.snapshot.race_generation, 2);
 });
 
 test('client uses injected monotonic time for receivedAt', () => {
 	let tick = 100;
 	let latest = null;
 	const arbiter = createStateClient((next) => (latest = next), { now: () => tick });
-	arbiter.accept({ sequence: 1, state: {} });
+	arbiter.accept(raceState(1));
 	assert.equal(latest.receivedAt, 100);
 	tick = 250;
-	arbiter.accept({ sequence: 2, state: {} });
+	arbiter.accept(raceState(2));
 	assert.equal(latest.receivedAt, 250);
 });
 
@@ -220,7 +269,7 @@ test('disconnect freezes clocks at their last monotonic value without rewinding'
 	let now = 100;
 	let latest = null;
 	const arbiter = createStateClient((next) => (latest = next), { now: () => now });
-	arbiter.accept({ sequence: 1, protocol_now: 10_000, race_elapsed_ms: 500, race_clock_running: true });
+	arbiter.accept(raceState(1, { protocol_now: 10_000, race_elapsed_ms: 500, race_clock_running: true }));
 	arbiter.setStatus('verbunden', true);
 	now = 350;
 	arbiter.setStatus('Verbindung unterbrochen', false);
@@ -301,6 +350,10 @@ test('control payload builders produce the exact API bodies', () => {
 		}).config.finish_condition,
 		{ time_ms: 60000 }
 	);
+	assert.deepEqual(nextRacePayload('race-1', 'race-2'), {
+		expected_race_id: 'race-1',
+		next_race_id: 'race-2'
+	});
 	assert.deepEqual(sensorPayload('2', 'rising'), { lane: 2, edge: 'rising' });
 	assert.deepEqual(raceChaosPayload(), { source: 'race_control' });
 	assert.deepEqual(laneChaosPayload('3'), { source: { lane: 3 } });

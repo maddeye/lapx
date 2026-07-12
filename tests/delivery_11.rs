@@ -74,13 +74,13 @@ async fn http_command_round_trip() {
     assert_eq!(snapshot.state.lane(1).unwrap().laps, 1);
 
     assert_eq!(
-        post(app.clone(), "/api/pause", serde_json::Value::Null)
+        post(app.clone(), "/api/pause", serde_json::json!({}))
             .await
             .status(),
         StatusCode::OK
     );
     assert_eq!(
-        post(app.clone(), "/api/resume", serde_json::Value::Null)
+        post(app.clone(), "/api/resume", serde_json::json!({}))
             .await
             .status(),
         StatusCode::OK

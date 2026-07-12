@@ -11,6 +11,7 @@
 	} from '$lib/state.js';
 	import {
 		startPayload,
+		nextRacePayload,
 		sensorPayload,
 		raceChaosPayload,
 		laneChaosPayload,
@@ -27,6 +28,7 @@
 	let clock = $state(0);
 	let pending = $state(false);
 	let drivers = $state([]);
+	let nextRaceId = $state('');
 
 	let lanes = $state(2);
 	let driverIds = $state(['', '', '', '']);
@@ -107,6 +109,14 @@
 		chaosKind,
 		chaosMs
 	})));
+	const nextRace = () => run(async () => {
+		const state = await postCommand(
+			'/api/next-race',
+			nextRacePayload(snapshot.race_id, nextRaceId)
+		);
+		nextRaceId = '';
+		return state;
+	});
 	const pause = () => run(() => postCommand('/api/pause'));
 	const resume = () => run(() => postCommand('/api/resume'));
 	const raceChaos = () => run(() => postCommand('/api/chaos', raceChaosPayload()));
@@ -130,6 +140,19 @@
 	{#if error}
 		<p class="error" role="alert">Fehler: {error}</p>
 	{/if}
+
+	<section aria-labelledby="race-heading">
+		<h2 id="race-heading">Aktuelles Rennen</h2>
+		<p><strong>Renn-ID:</strong> {snapshot?.race_id ?? '–'}</p>
+		{#if snapshot?.state?.status === 'finished' || snapshot?.state?.status === 'aborted'}
+			<form onsubmit={(event) => (event.preventDefault(), nextRace())}>
+				<label>Nächste Renn-ID
+					<input required bind:value={nextRaceId} />
+				</label>
+				<button type="submit" disabled={pending}>Nächstes Rennen</button>
+			</form>
+		{/if}
+	</section>
 
 	<section aria-labelledby="config-heading">
 		<h2 id="config-heading">Rennkonfiguration</h2>

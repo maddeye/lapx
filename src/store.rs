@@ -76,8 +76,19 @@ pub struct EloSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
+    pub race_id: String,
+    pub race_generation: u64,
     pub sequence: u64,
     pub state: RaceState,
+}
+
+impl StateSnapshot {
+    pub fn follows(&self, previous: &Self) -> bool {
+        if self.race_generation != previous.race_generation {
+            return self.race_generation > previous.race_generation;
+        }
+        self.race_id == previous.race_id && self.sequence > previous.sequence
+    }
 }
 
 impl Deref for StateSnapshot {
@@ -108,6 +119,12 @@ impl<E> From<StoreError> for ImmediateError<E> {
     }
 }
 
+impl<E> From<rusqlite::Error> for ImmediateError<E> {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Store(value.into())
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(rusqlite::Error),
@@ -126,6 +143,10 @@ pub enum StoreError {
     RaceNotFound(String),
     RaceAlreadyLinked(String),
     RaceAssignmentsMismatch,
+    InvalidRaceId,
+    CurrentRaceConflict { expected: String, actual: String },
+    RaceNotTerminal(String),
+    RaceAlreadyExists(String),
     CorruptProtocol(String),
 }
 
@@ -168,7 +189,12 @@ impl SqliteStore {
         let connection = store.connect()?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS race_events (
+            "CREATE TABLE IF NOT EXISTS current_race (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                race_id TEXT NOT NULL CHECK (length(trim(race_id)) > 0),
+                generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS race_events (
                 race_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL CHECK (sequence > 0),
                 event_type TEXT NOT NULL,
@@ -272,6 +298,8 @@ impl SqliteStore {
         }
         events.extend(emitted);
         let snapshot = StateSnapshot {
+            race_id: race_id.to_owned(),
+            race_generation: race_generation(&transaction, race_id)?,
             sequence: events.len() as u64,
             state: replay(&events)?.state().clone(),
         };
@@ -282,6 +310,90 @@ impl SqliteStore {
     pub fn load(&self, race_id: &str) -> Result<StateSnapshot, StoreError> {
         let connection = self.connect()?;
         snapshot(&connection, race_id)
+    }
+
+    pub fn initialize_current_race(
+        &self,
+        fallback_race_id: &str,
+    ) -> Result<StateSnapshot, StoreError> {
+        let fallback_race_id = valid_race_id(fallback_race_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO current_race (singleton, race_id, generation) VALUES (1, ?1, 0)",
+            [fallback_race_id],
+        )?;
+        let race_id: String = transaction.query_row(
+            "SELECT race_id FROM current_race WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current = snapshot(&transaction, &race_id)?;
+        transaction.commit()?;
+        Ok(current)
+    }
+
+    pub fn switch_current_race(
+        &self,
+        expected_race_id: &str,
+        next_race_id: &str,
+    ) -> Result<StateSnapshot, StoreError> {
+        match self.switch_current_race_with(expected_race_id, next_race_id, || {
+            Ok::<_, std::convert::Infallible>(())
+        }) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(ImmediateError::Store(error)) => Err(error),
+            Err(ImmediateError::Callback { source, .. }) => match source {},
+        }
+    }
+
+    pub fn switch_current_race_with<E>(
+        &self,
+        expected_race_id: &str,
+        next_race_id: &str,
+        before_commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<StateSnapshot, ImmediateError<E>> {
+        let next_race_id = valid_race_id(next_race_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual: String = transaction.query_row(
+            "SELECT race_id FROM current_race WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != expected_race_id {
+            return Err(StoreError::CurrentRaceConflict {
+                expected: expected_race_id.to_owned(),
+                actual,
+            }
+            .into());
+        }
+        let current = snapshot(&transaction, &actual)?;
+        if !matches!(
+            current.state.status,
+            RaceStatus::Finished(_) | RaceStatus::Aborted
+        ) {
+            return Err(StoreError::RaceNotTerminal(actual).into());
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM race_events WHERE race_id = ?1)",
+            [next_race_id],
+            |row| row.get(0),
+        )?;
+        if exists || next_race_id == actual {
+            return Err(StoreError::RaceAlreadyExists(next_race_id.to_owned()).into());
+        }
+        before_commit().map_err(|source| ImmediateError::Callback {
+            snapshot: Box::new(current),
+            source,
+        })?;
+        transaction.execute(
+            "UPDATE current_race SET race_id = ?1, generation = generation + 1 WHERE singleton = 1",
+            [next_race_id],
+        )?;
+        let next = snapshot(&transaction, next_race_id)?;
+        transaction.commit()?;
+        Ok(next)
     }
 
     pub fn with_immediate_head<T, E>(
@@ -546,6 +658,14 @@ fn validate_active_drivers(
     Ok(())
 }
 
+fn valid_race_id(race_id: &str) -> Result<&str, StoreError> {
+    if race_id.trim().is_empty() {
+        Err(StoreError::InvalidRaceId)
+    } else {
+        Ok(race_id)
+    }
+}
+
 fn driver_name(display_name: &str) -> Result<&str, StoreError> {
     let display_name = display_name.trim();
     if display_name.is_empty() {
@@ -581,9 +701,21 @@ fn replay(events: &[Event]) -> Result<RaceEngine, StoreError> {
 fn snapshot(connection: &Connection, race_id: &str) -> Result<StateSnapshot, StoreError> {
     let events = load_events(connection, race_id)?;
     Ok(StateSnapshot {
+        race_id: race_id.to_owned(),
+        race_generation: race_generation(connection, race_id)?,
         sequence: events.len() as u64,
         state: replay(&events)?.state().clone(),
     })
+}
+
+fn race_generation(connection: &Connection, race_id: &str) -> Result<u64, StoreError> {
+    connection
+        .query_row(
+            "SELECT COALESCE((SELECT generation FROM current_race WHERE singleton = 1 AND race_id = ?1), 0)",
+            [race_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
 }
 
 fn load_events(connection: &Connection, race_id: &str) -> Result<Vec<Event>, StoreError> {
