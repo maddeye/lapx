@@ -2,6 +2,7 @@
 // actual control markup (forms, buttons, labels) without a browser.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -72,6 +73,7 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 	const tournament = {
 		id: 3,
 		name: 'Sommer-Cup',
+		generation: { mode: 'elo_balanced', seed: '42', lane_count: 2 },
 		heats: [{
 			id: 9,
 			position: 1,
@@ -100,6 +102,16 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 		'Turniere',
 		'Turniername',
 		'Turnier anlegen',
+		'Name des generierten Turniers',
+		'Fahrer auswählen',
+		'Generierungsmodus',
+		'Zufällig',
+		'Elo-ausgeglichen',
+		'Seed (0 bis 18446744073709551615)',
+		'Bahnen pro Lauf',
+		'Turnier generieren',
+		'Generiert:',
+		'Seed 42',
 		'Sommer-Cup',
 		'Lauf anhängen',
 		'Rennen einmalig verknüpfen',
@@ -113,6 +125,14 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 	for (const forbidden of ['Turnierstand', 'Turniersieger', 'Bracket']) {
 		assert.ok(!body.includes(forbidden), `admin must not expose ${forbidden}`);
 	}
+});
+
+test('generated tournament sends its seed as a JSON string', async () => {
+	const source = await readFile(path.join(root, '../src/routes/admin/+page.svelte'), 'utf8');
+	assert.match(source, /body: body === undefined \? undefined : JSON\.stringify\(body\)/);
+	assert.match(source, /seed: generatedSeed/);
+	assert.doesNotMatch(source, /typeof body === 'string'/);
+	assert.doesNotMatch(source, /const body = `/);
 });
 
 test('rennscreen renders the public display without controls', async () => {
