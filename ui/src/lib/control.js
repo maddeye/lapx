@@ -8,6 +8,9 @@ export function startPayload(form) {
 	return {
 		config: {
 			lanes: Number(form.lanes),
+			driver_ids: form.driverIds
+				.slice(0, Number(form.lanes))
+				.map((id) => (id === '' || id === null ? null : Number(id))),
 			start_sequence_ms: Number(form.startSequenceMs),
 			restart_sequence_ms: Number(form.restartSequenceMs),
 			minimum_lap_time_ms: Number(form.minimumLapTimeMs),

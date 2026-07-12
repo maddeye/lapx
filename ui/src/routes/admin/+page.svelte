@@ -1,9 +1,12 @@
 <script>
 	import { onMount } from 'svelte';
+	import { formatLaps, formatMs } from '$lib/state.js';
 
 	let { initialDrivers = [] } = $props();
 	// svelte-ignore state_referenced_locally
 	let drivers = $state(initialDrivers);
+	let history = $state([]);
+	let stats = $state([]);
 	let displayName = $state('');
 	let pending = $state(false);
 	let error = $state('');
@@ -31,7 +34,14 @@
 		}
 	}
 
-	const load = () => run(async () => (drivers = await request('/api/drivers')));
+	const load = () => run(async () => {
+		[drivers, history, stats] = await Promise.all([
+			request('/api/drivers'),
+			request('/api/race-history'),
+			request('/api/driver-stats')
+		]);
+	});
+	const driverName = (id) => drivers.find((driver) => driver.id === id)?.display_name ?? `Fahrer ${id}`;
 	const create = () => run(async () => {
 		const driver = await request('/api/drivers', { display_name: displayName });
 		drivers = [...drivers, driver];
@@ -91,6 +101,46 @@
 			</ul>
 		{/if}
 	</section>
+
+	<section aria-labelledby="stats-heading">
+		<h2 id="stats-heading">Fahrerstatistik</h2>
+		{#if stats.length === 0}
+			<p>Keine abgeschlossenen Rennen vorhanden.</p>
+		{:else}
+			<table>
+				<thead><tr><th>Fahrer</th><th>Starts</th><th>Siege</th><th>Beste gültige Runde</th></tr></thead>
+				<tbody>
+					{#each stats as stat (stat.driver_id)}
+						<tr><th>{driverName(stat.driver_id)}</th><td>{stat.starts}</td><td>{stat.wins}</td><td>{formatMs(stat.best_lap_ms)}</td></tr>
+					{/each}
+				</tbody>
+			</table>
+		{/if}
+	</section>
+
+	<section aria-labelledby="history-heading">
+		<h2 id="history-heading">Rennhistorie</h2>
+		{#if history.length === 0}
+			<p>Keine abgeschlossenen Rennen vorhanden.</p>
+		{:else}
+			{#each history as race (race.race_id)}
+				<h3>{race.race_id}</h3>
+				<table>
+					<thead><tr><th>Platz</th><th>Bahn</th><th>Fahrer</th><th>Runden</th><th>Ergebniszeit</th><th>Beste Runde</th></tr></thead>
+					<tbody>
+						{#each race.results as result (result.lane)}
+							<tr>
+								<td>{result.position}</td><td>{result.lane}</td>
+								<td>{result.driver_id === null ? 'Anonym' : driverName(result.driver_id)}</td>
+								<td>{formatLaps(result.corrected_laps_thousandths)}</td>
+								<td>{formatMs(result.result_time_ms)}</td><td>{formatMs(result.best_lap_ms)}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/each}
+		{/if}
+	</section>
 </main>
 
 <style>
@@ -108,7 +158,7 @@
 		flex-direction: column;
 		gap: 1.5rem;
 	}
-	h1, h2, p, ul { margin: 0; }
+	h1, h2, h3, p, ul { margin: 0; }
 	.error { color: #a40000; font-weight: bold; }
 	ul { padding: 0; list-style: none; }
 	li { padding: 0.75rem 0; border-top: 1px solid #bbb; }
@@ -116,4 +166,6 @@
 	label { display: flex; flex-direction: column; gap: 0.25rem; }
 	input, button { font: inherit; padding: 0.4em 0.6em; }
 	button { cursor: pointer; }
+	table { width: 100%; border-collapse: collapse; }
+	th, td { padding: 0.4em; text-align: left; border-bottom: 1px solid #bbb; }
 </style>

@@ -15,6 +15,7 @@ use tokio::time::Instant;
 fn race_config() -> RaceConfig {
     RaceConfig {
         lanes: 2,
+        driver_ids: vec![None; 2],
         start_sequence_ms: 1,
         restart_sequence_ms: 1,
         minimum_lap_time_ms: 100,

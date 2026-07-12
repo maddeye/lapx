@@ -14,6 +14,7 @@ use tempfile::tempdir;
 fn config() -> RaceConfig {
     RaceConfig {
         lanes: 2,
+        driver_ids: vec![None; 2],
         start_sequence_ms: 10,
         restart_sequence_ms: 5,
         minimum_lap_time_ms: 100,
@@ -58,7 +59,7 @@ fn sqlite_store_replays_committed_events() {
 }
 
 #[test]
-fn literal_v1_sqlite_protocol_uses_backward_compatible_config_defaults() {
+fn old_anonymous_protocol_compatibility() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
     let store = SqliteStore::open(&path).unwrap();
@@ -88,6 +89,7 @@ fn literal_v1_sqlite_protocol_uses_backward_compatible_config_defaults() {
 
     let state = store.load("old-race").unwrap();
     let config = state.config().unwrap();
+    assert_eq!(config.driver_ids, vec![None; 2]);
     assert_eq!(config.restart_sequence_ms, config.start_sequence_ms);
     assert_eq!(config.false_start_consequence, Consequence::Abort);
     assert_eq!(config.chaos_consequence, Consequence::Abort);

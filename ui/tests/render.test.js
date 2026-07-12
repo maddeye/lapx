@@ -51,6 +51,8 @@ test('control page renders every Rennleiter control and no Advance', async () =>
 	}
 	for (const label of [
 		'Bahnen',
+		'Fahrer Bahn 1',
+		'Fahrer Bahn 2',
 		'Startsequenz (ms)',
 		'Mindestrundenzeit (ms)',
 		'Zielbedingung',
@@ -78,7 +80,9 @@ test('admin page renders Fahrer create, rename, archive controls', async () => {
 		'Fahrerliste',
 		'Ada',
 		'Umbenennen',
-		'Archivieren'
+		'Archivieren',
+		'Fahrerstatistik',
+		'Rennhistorie'
 	]) {
 		assert.ok(body.includes(text), `missing admin control ${text}`);
 	}

@@ -256,6 +256,7 @@ test('control payload builders produce the exact API bodies', () => {
 	assert.deepEqual(
 		startPayload({
 			lanes: '2',
+			driverIds: ['7', ''],
 			startSequenceMs: '3000',
 			restartSequenceMs: '2000',
 			minimumLapTimeMs: '1500',
@@ -271,6 +272,7 @@ test('control payload builders produce the exact API bodies', () => {
 		{
 			config: {
 				lanes: 2,
+				driver_ids: [7, null],
 				start_sequence_ms: 3000,
 				restart_sequence_ms: 2000,
 				minimum_lap_time_ms: 1500,
@@ -284,6 +286,7 @@ test('control payload builders produce the exact API bodies', () => {
 	assert.deepEqual(
 		startPayload({
 			lanes: 4,
+			driverIds: ['', '', '', ''],
 			startSequenceMs: 1,
 			restartSequenceMs: 1,
 			minimumLapTimeMs: 1,

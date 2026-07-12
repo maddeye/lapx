@@ -26,8 +26,10 @@
 	let disconnectedAt = $state(null);
 	let clock = $state(0);
 	let pending = $state(false);
+	let drivers = $state([]);
 
 	let lanes = $state(2);
+	let driverIds = $state(['', '', '', '']);
 	let startSequenceMs = $state(3000);
 	let restartSequenceMs = $state(3000);
 	let minimumLapTimeMs = $state(3000);
@@ -59,6 +61,10 @@
 		});
 		const stream = connectState(client);
 		accept = stream.accept;
+		fetch('/api/drivers')
+			.then((response) => response.ok ? response.json() : Promise.reject(new Error(`Fehler ${response.status}`)))
+			.then((items) => (drivers = items.filter((driver) => driver.archived_at === null)))
+			.catch((failure) => (error = failure.message));
 		const timer = setInterval(() => (clock = performance.now()), 100);
 		return () => {
 			clearInterval(timer);
@@ -88,6 +94,7 @@
 
 	const start = () => run(() => postCommand('/api/start', startPayload({
 		lanes,
+		driverIds,
 		startSequenceMs,
 		restartSequenceMs,
 		minimumLapTimeMs,
@@ -131,6 +138,16 @@
 				<label>Bahnen
 					<input type="number" min="1" max="4" bind:value={lanes} />
 				</label>
+				{#each Array.from({ length: lanes }, (_, index) => index + 1) as lane}
+					<label>Fahrer Bahn {lane}
+						<select bind:value={driverIds[lane - 1]}>
+							<option value="">Anonym</option>
+							{#each drivers as driver (driver.id)}
+								<option value={driver.id}>{driver.display_name}</option>
+							{/each}
+						</select>
+					</label>
+				{/each}
 				<label>Startsequenz (ms)
 					<input type="number" min="1" bind:value={startSequenceMs} />
 				</label>
