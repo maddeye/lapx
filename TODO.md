@@ -120,7 +120,7 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
   - Add stable Fahrer identities with list, create, rename, and archive operations.
   - Verify: `cargo test driver_crud_round_trip`.
 
-- [ ] **Delivery 23 — [Race history statistics](.plans/best-path/slice-23.html)**
+- [x] **Delivery 23 — [Race history statistics](.plans/best-path/slice-23.html)**
   - Assign Fahrer through race events and derive corrected history, starts, wins, and best laps from Rennprotokolle.
   - Verify: `cargo test driver_stats_from_completed_race correction_updates_driver_stats`.
 

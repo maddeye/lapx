@@ -2,7 +2,7 @@ use crate::{
     domain::{ChaosSource, Command, RaceConfig, SignalEdge},
     hardware::HardwareSnapshot,
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
-    store::{Driver, StoreError},
+    store::{CompletedRace, Driver, DriverStats, StoreError},
 };
 use async_stream::stream;
 use axum::{
@@ -38,6 +38,8 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/admin", get(assets::admin))
         .route("/_app/{*path}", get(assets::app_asset))
         .route("/api/drivers", get(drivers).post(create_driver))
+        .route("/api/race-history", get(race_history))
+        .route("/api/driver-stats", get(driver_stats))
         .route("/api/drivers/{id}/rename", post(rename_driver))
         .route("/api/drivers/{id}/archive", post(archive_driver))
         .route("/api/hardware", get(hardware_state))
@@ -104,6 +106,20 @@ struct DriverNameInput {
 async fn drivers(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<Vec<Driver>>, HttpError> {
     let store = runtime.store();
     Ok(Json(store_task(move || store.drivers()).await?))
+}
+
+async fn race_history(
+    State(runtime): State<Arc<RaceRuntime>>,
+) -> Result<Json<Vec<CompletedRace>>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.completed_races()).await?))
+}
+
+async fn driver_stats(
+    State(runtime): State<Arc<RaceRuntime>>,
+) -> Result<Json<Vec<DriverStats>>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.driver_stats()).await?))
 }
 
 async fn create_driver(
@@ -321,8 +337,10 @@ impl IntoResponse for HttpError {
         }
         let status = match &self {
             Self::Malformed(_)
-            | Self::Store(StoreError::InvalidDriverName)
-            | Self::Runtime(RuntimeError::Store(StoreError::Domain(_)))
+            | Self::Store(StoreError::InvalidDriverName | StoreError::DriverNotActive(_))
+            | Self::Runtime(RuntimeError::Store(
+                StoreError::Domain(_) | StoreError::DriverNotActive(_),
+            ))
             | Self::Runtime(RuntimeError::HardwareLaneMismatch { .. }) => StatusCode::BAD_REQUEST,
             Self::HardwareUnavailable | Self::Store(StoreError::DriverNotFound(_)) => {
                 StatusCode::NOT_FOUND
@@ -334,6 +352,10 @@ impl IntoResponse for HttpError {
         };
         let message = match &self {
             Self::Malformed(message) => message.clone(),
+            Self::Store(StoreError::DriverNotActive(id))
+            | Self::Runtime(RuntimeError::Store(StoreError::DriverNotActive(id))) => {
+                format!("driver {id} is missing or archived")
+            }
             Self::Runtime(error) => error.to_string(),
             Self::HardwareUnavailable => "hardware is not configured".into(),
             Self::Store(StoreError::InvalidDriverName) => "display_name must not be blank".into(),

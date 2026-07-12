@@ -37,6 +37,7 @@ impl Consequence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RaceConfig {
     pub lanes: u8,
+    pub driver_ids: Vec<Option<i64>>,
     pub start_sequence_ms: ProtocolMillis,
     pub restart_sequence_ms: ProtocolMillis,
     pub minimum_lap_time_ms: ProtocolMillis,
@@ -54,6 +55,8 @@ impl<'de> Deserialize<'de> for RaceConfig {
         #[derive(Deserialize)]
         struct CompatibleConfig {
             lanes: u8,
+            #[serde(default)]
+            driver_ids: Option<Vec<Option<i64>>>,
             start_sequence_ms: ProtocolMillis,
             restart_sequence_ms: Option<ProtocolMillis>,
             minimum_lap_time_ms: ProtocolMillis,
@@ -66,6 +69,9 @@ impl<'de> Deserialize<'de> for RaceConfig {
         let value = CompatibleConfig::deserialize(deserializer)?;
         Ok(Self {
             lanes: value.lanes,
+            driver_ids: value
+                .driver_ids
+                .unwrap_or_else(|| vec![None; value.lanes as usize]),
             start_sequence_ms: value.start_sequence_ms,
             restart_sequence_ms: value.restart_sequence_ms.unwrap_or(value.start_sequence_ms),
             minimum_lap_time_ms: value.minimum_lap_time_ms,
@@ -277,11 +283,24 @@ pub enum DomainError {
     },
     InvalidEventOrder,
     NegativeCorrectedLaps,
+    InvalidDriverAssignments,
 }
 
 pub(crate) fn validate_config(config: &RaceConfig) -> Result<(), DomainError> {
     if !(1..=4).contains(&config.lanes) {
         return Err(DomainError::InvalidLaneCount);
+    }
+    if config.driver_ids.len() != config.lanes as usize
+        || config.driver_ids.iter().flatten().any(|id| *id <= 0)
+        || config
+            .driver_ids
+            .iter()
+            .flatten()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != config.driver_ids.iter().flatten().count()
+    {
+        return Err(DomainError::InvalidDriverAssignments);
     }
     if config.start_sequence_ms == 0
         || config.restart_sequence_ms == 0

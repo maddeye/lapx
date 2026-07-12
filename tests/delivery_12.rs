@@ -15,6 +15,7 @@ use tower::ServiceExt;
 fn config() -> RaceConfig {
     RaceConfig {
         lanes: 1,
+        driver_ids: vec![None],
         start_sequence_ms: 1_000,
         restart_sequence_ms: 500,
         minimum_lap_time_ms: 100,

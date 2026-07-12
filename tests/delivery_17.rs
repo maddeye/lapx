@@ -22,6 +22,7 @@ use tempfile::tempdir;
 fn race_config(finish: FinishCondition, chaos: Consequence) -> RaceConfig {
     RaceConfig {
         lanes: 2,
+        driver_ids: vec![None; 2],
         start_sequence_ms: 10,
         restart_sequence_ms: 10,
         minimum_lap_time_ms: 100,

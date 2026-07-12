@@ -102,6 +102,7 @@ async fn hardware_runtime_rejects_a_race_lane_mismatch_before_commit() {
         .apply(Command::StartRace {
             config: RaceConfig {
                 lanes: 2,
+                driver_ids: vec![None; 2],
                 start_sequence_ms: 10,
                 restart_sequence_ms: 10,
                 minimum_lap_time_ms: 10,

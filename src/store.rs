@@ -1,7 +1,8 @@
-use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState};
+use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState, RaceStatus};
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fmt,
     ops::Deref,
     path::{Path, PathBuf},
@@ -15,6 +16,32 @@ pub struct Driver {
     pub id: i64,
     pub display_name: String,
     pub archived_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaceResult {
+    pub position: u8,
+    pub lane: u8,
+    pub driver_id: Option<i64>,
+    pub corrected_laps_thousandths: i64,
+    pub result_time_ms: Option<u64>,
+    pub best_lap_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedRace {
+    pub race_id: String,
+    pub official_start_at: u64,
+    pub finished_at: u64,
+    pub results: Vec<RaceResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverStats {
+    pub driver_id: i64,
+    pub starts: u64,
+    pub wins: u64,
+    pub best_lap_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +85,7 @@ pub enum StoreError {
     Domain(DomainError),
     InvalidDriverName,
     DriverNotFound(i64),
+    DriverNotActive(i64),
     CorruptProtocol(String),
 }
 
@@ -150,6 +178,9 @@ impl SqliteStore {
         let mut events = load_events(&transaction, race_id)?;
         let engine = replay(&events)?;
         let emitted = engine.handle(command(engine.state().last_event_at))?;
+        if let Some(Event::RaceConfigured { config, .. }) = emitted.first() {
+            validate_active_drivers(&transaction, &config.driver_ids)?;
+        }
         let first_sequence = events.len() as i64 + 1;
         for (offset, event) in emitted.iter().enumerate() {
             transaction.execute(
@@ -204,6 +235,74 @@ impl SqliteStore {
         rows.collect::<Result<_, _>>().map_err(StoreError::from)
     }
 
+    pub fn completed_races(&self) -> Result<Vec<CompletedRace>, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let race_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT race_id
+                 FROM race_events
+                 GROUP BY race_id
+                 HAVING SUM(event_type = 'race_finished') > 0
+                 ORDER BY MAX(CASE WHEN event_type = 'race_finished' THEN rowid END) DESC",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut races = Vec::new();
+        for race_id in race_ids {
+            let events = load_events(&transaction, &race_id)?;
+            let state = replay(&events)?.state().clone();
+            if let RaceStatus::Finished(finished) = &state.status {
+                let results = state
+                    .standings()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, standing)| RaceResult {
+                        position: index as u8 + 1,
+                        lane: standing.lane,
+                        driver_id: finished.config.driver_ids[standing.lane as usize - 1],
+                        corrected_laps_thousandths: standing.corrected_laps_thousandths,
+                        result_time_ms: standing.result_time_ms,
+                        best_lap_ms: state.lane(standing.lane).and_then(|lane| lane.best_lap_ms),
+                    })
+                    .collect();
+                races.push(CompletedRace {
+                    race_id,
+                    official_start_at: finished.official_start_at,
+                    finished_at: finished.finished_at,
+                    results,
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(races)
+    }
+
+    pub fn driver_stats(&self) -> Result<Vec<DriverStats>, StoreError> {
+        let mut stats = BTreeMap::<i64, DriverStats>::new();
+        for race in self.completed_races()? {
+            for result in race.results {
+                let Some(driver_id) = result.driver_id else {
+                    continue;
+                };
+                let stat = stats.entry(driver_id).or_insert(DriverStats {
+                    driver_id,
+                    starts: 0,
+                    wins: 0,
+                    best_lap_ms: None,
+                });
+                stat.starts += 1;
+                stat.wins += u64::from(result.position == 1);
+                if let Some(lap) = result.best_lap_ms {
+                    stat.best_lap_ms = Some(stat.best_lap_ms.map_or(lap, |best| best.min(lap)));
+                }
+            }
+        }
+        Ok(stats.into_values().collect())
+    }
+
     pub fn create_driver(&self, display_name: &str) -> Result<Driver, StoreError> {
         let display_name = driver_name(display_name)?;
         let connection = self.connect()?;
@@ -245,6 +344,23 @@ impl SqliteStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
+}
+
+fn validate_active_drivers(
+    connection: &Connection,
+    driver_ids: &[Option<i64>],
+) -> Result<(), StoreError> {
+    for id in driver_ids.iter().flatten() {
+        let active: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drivers WHERE id = ?1 AND archived_at IS NULL)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !active {
+            return Err(StoreError::DriverNotActive(*id));
+        }
+    }
+    Ok(())
 }
 
 fn driver_name(display_name: &str) -> Result<&str, StoreError> {
