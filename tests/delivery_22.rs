@@ -96,6 +96,18 @@ async fn driver_crud_round_trip() {
     assert_eq!(renamed.id, created.id);
     assert_eq!(renamed.display_name, "Grace");
 
+    let form_archive = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/drivers/{}/archive", created.id))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("confirm=yes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(form_archive.status(), StatusCode::BAD_REQUEST);
+
     let archived: Driver = serde_json::from_value(
         json(
             &app,

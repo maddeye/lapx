@@ -132,7 +132,9 @@ async fn rename_driver(
 async fn archive_driver(
     State(runtime): State<Arc<RaceRuntime>>,
     Path(id): Path<i64>,
+    input: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<Driver>, HttpError> {
+    parse(input)?;
     let store = runtime.store();
     Ok(Json(store_task(move || store.archive_driver(id)).await?))
 }
