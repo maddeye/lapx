@@ -26,11 +26,14 @@ fn config() -> RaceConfig {
     }
 }
 
-fn max_id(chunk: &[u8]) -> Option<u64> {
+fn max_id(chunk: &[u8]) -> Option<(u64, u64)> {
     String::from_utf8_lossy(chunk)
         .lines()
         .filter_map(|line| line.strip_prefix("id: "))
-        .filter_map(|id| id.parse().ok())
+        .filter_map(|id| id.split_once(':'))
+        .filter_map(|(generation, sequence)| {
+            Some((generation.parse().ok()?, sequence.parse().ok()?))
+        })
         .max()
 }
 
@@ -83,12 +86,12 @@ async fn sse_emits_state_after_command() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     let mut body = response.into_body();
-    assert_eq!(max_id(&next_chunk(&mut body).await), Some(0));
+    assert_eq!(max_id(&next_chunk(&mut body).await), Some((0, 0)));
 
     let committed = start(app).await;
     assert_eq!(
         max_id(&next_chunk(&mut body).await),
-        Some(committed.sequence)
+        Some((committed.race_generation, committed.sequence))
     );
 }
 
@@ -112,12 +115,13 @@ async fn sse_connection_race_never_loses_a_commit() {
     let (response, committed) = tokio::join!(connect, command);
     let mut body = response.unwrap().into_body();
     let first = max_id(&next_chunk(&mut body).await).unwrap();
-    let observed = if first >= committed.sequence {
+    let committed = (committed.race_generation, committed.sequence);
+    let observed = if first >= committed {
         first
     } else {
         max_id(&next_chunk(&mut body).await).unwrap()
     };
-    assert!(observed >= committed.sequence);
+    assert!(observed >= committed);
 }
 
 #[tokio::test]
@@ -160,6 +164,6 @@ async fn sse_lag_reloads_the_full_current_state() {
         latest = snapshot.sequence;
     }
 
-    assert_eq!(max_id(&next_chunk(&mut body).await), Some(0));
-    assert_eq!(max_id(&next_chunk(&mut body).await), Some(latest));
+    assert_eq!(max_id(&next_chunk(&mut body).await), Some((0, 0)));
+    assert_eq!(max_id(&next_chunk(&mut body).await), Some((0, latest)));
 }

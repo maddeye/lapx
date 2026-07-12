@@ -411,20 +411,17 @@ async fn state_stream(
         let mut cursor = initial;
         yield Ok::<_, Infallible>(initial_event);
         loop {
-            let (snapshot, authoritative) = match receiver.recv().await {
-                Ok(snapshot) => (snapshot, false),
+            let snapshot = match receiver.recv().await {
+                Ok(snapshot) => snapshot,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     match runtime.snapshot().await {
-                        Ok(snapshot) => (snapshot, true),
+                        Ok(snapshot) => snapshot,
                         Err(_) => break,
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            let reloaded_switch = authoritative
-                && snapshot.race_id != cursor.race_id
-                && matches!(cursor.state.status, crate::domain::RaceStatus::Finished(_) | crate::domain::RaceStatus::Aborted);
-            if snapshot.follows(&cursor) || reloaded_switch {
+            if snapshot.follows(&cursor) {
                 cursor = snapshot.clone();
                 // Clock failure ends the stream; the client reconnects.
                 match state_event(&runtime, snapshot) {
@@ -446,7 +443,10 @@ fn parse<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
 fn state_event(runtime: &RaceRuntime, snapshot: StateSnapshot) -> Result<Event, HttpError> {
     let event = Event::default()
         .event("state")
-        .id(snapshot.sequence.to_string())
+        .id(format!(
+            "{}:{}",
+            snapshot.race_generation, snapshot.sequence
+        ))
         .data(
             serde_json::to_string(&http_state(runtime, snapshot)?)
                 .expect("state snapshot is serializable"),

@@ -97,7 +97,11 @@ async fn current_race_switch_is_atomic_fresh_and_survives_restart() {
     let path = dir.path().join("switch.db");
     let store = SqliteStore::open(&path).unwrap();
     let runtime = RaceRuntime::new(store.clone(), "fallback").await.unwrap();
-    assert_eq!(runtime.snapshot().await.unwrap().race_id, "fallback");
+    let initial = runtime.snapshot().await.unwrap();
+    assert_eq!(
+        (initial.race_id.as_str(), initial.race_generation),
+        ("fallback", 0)
+    );
 
     let premature = runtime.next_race("fallback", "next").await.unwrap_err();
     assert!(matches!(
@@ -106,6 +110,13 @@ async fn current_race_switch_is_atomic_fresh_and_survives_restart() {
     ));
     let terminal = finish(&runtime).await;
     assert!(matches!(terminal.state.status, RaceStatus::Finished(_)));
+    assert!(terminal.follows(&initial));
+    let wrong_race = StateSnapshot {
+        race_id: "wrong".into(),
+        sequence: terminal.sequence + 1,
+        ..terminal.clone()
+    };
+    assert!(!wrong_race.follows(&terminal));
 
     let conflict = runtime.next_race("stale", "next").await.unwrap_err();
     assert!(matches!(
@@ -118,7 +129,10 @@ async fn current_race_switch_is_atomic_fresh_and_survives_restart() {
     ));
 
     let next = runtime.next_race("fallback", "next").await.unwrap();
-    assert_eq!((next.race_id.as_str(), next.sequence), ("next", 0));
+    assert_eq!(
+        (next.race_id.as_str(), next.race_generation, next.sequence),
+        ("next", 1, 0)
+    );
     assert!(matches!(next.state.status, RaceStatus::Ready));
     assert!(store.events("next").unwrap().is_empty());
     assert!(matches!(
@@ -132,6 +146,9 @@ async fn current_race_switch_is_atomic_fresh_and_survives_restart() {
         .await
         .unwrap();
     assert_eq!(restarted.snapshot().await.unwrap(), next);
+    finish(&restarted).await;
+    let third = restarted.next_race("next", "third").await.unwrap();
+    assert_eq!(third.race_generation, 2);
 }
 
 #[tokio::test]
@@ -216,8 +233,9 @@ async fn race_aware_publication_http_and_sse_accept_only_the_switch_boundary() {
     assert_eq!(updates.recv().await.unwrap(), switched);
     let event = stream.frame().await.unwrap().unwrap().into_data().unwrap();
     let event = String::from_utf8_lossy(&event);
-    assert!(event.contains("id: 0"));
+    assert!(event.contains("id: 1:0"));
     assert!(event.contains("\"race_id\":\"new\""));
+    assert!(event.contains("\"race_generation\":1"));
 
     let state = public
         .oneshot(Request::get("/api/state").body(Body::empty()).unwrap())
@@ -225,7 +243,141 @@ async fn race_aware_publication_http_and_sse_accept_only_the_switch_boundary() {
         .unwrap();
     let snapshot: StateSnapshot =
         serde_json::from_slice(&to_bytes(state.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!((snapshot.race_id.as_str(), snapshot.sequence), ("new", 0));
+    assert_eq!(
+        (
+            snapshot.race_id.as_str(),
+            snapshot.race_generation,
+            snapshot.sequence,
+        ),
+        ("new", 1, 0)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_terminal_commit_then_immediate_switch_publishes_new_generation() {
+    let dir = tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("external-switch.db")).unwrap();
+    let runtime = RaceRuntime::new(store.clone(), "old").await.unwrap();
+    runtime
+        .apply(Command::StartRace {
+            config: config(),
+            at: 0,
+        })
+        .await
+        .unwrap();
+    runtime.apply(Command::AdvanceRace { to: 1 }).await.unwrap();
+    let mut updates = runtime.subscribe();
+
+    let terminal = store
+        .execute(
+            "old",
+            Command::SensorTriggered {
+                lane: 1,
+                edge: SignalEdge::Rising,
+                at: 2,
+            },
+        )
+        .unwrap();
+    assert_eq!(terminal.race_generation, 0);
+    let switched = runtime.next_race("old", "new").await.unwrap();
+    assert_eq!(switched.race_generation, 1);
+    assert!(!terminal.follows(&switched));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        switched
+    );
+
+    let externally_started = store
+        .execute(
+            "new",
+            Command::StartRace {
+                config: config(),
+                at: 3,
+            },
+        )
+        .unwrap();
+    assert_eq!(externally_started.race_generation, 1);
+    assert_eq!(runtime.snapshot().await.unwrap(), externally_started);
+    assert_eq!(store.load("old").unwrap().race_generation, 0);
+}
+
+#[tokio::test]
+async fn sse_lag_recovers_new_active_generation_with_or_without_terminal_observed() {
+    for terminal_observed in [false, true] {
+        let dir = tempdir().unwrap();
+        let runtime =
+            RaceRuntime::new(SqliteStore::open(dir.path().join("lag.db")).unwrap(), "old")
+                .await
+                .unwrap();
+        runtime
+            .apply(Command::StartRace {
+                config: config(),
+                at: 0,
+            })
+            .await
+            .unwrap();
+        runtime.apply(Command::AdvanceRace { to: 1 }).await.unwrap();
+
+        let response = local_router(runtime.clone())
+            .oneshot(
+                Request::get("/api/state/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut stream = response.into_body();
+        let initial = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert!(String::from_utf8_lossy(&initial).contains("\"race_generation\":0"));
+
+        finish_active(&runtime, 2).await;
+        if terminal_observed {
+            let terminal = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert!(String::from_utf8_lossy(&terminal).contains("\"status\":\"finished\""));
+        }
+        runtime.next_race("old", "new").await.unwrap();
+        let mut long = config();
+        long.finish_condition = FinishCondition::Laps(100);
+        runtime
+            .apply(Command::StartRace {
+                config: long,
+                at: 3,
+            })
+            .await
+            .unwrap();
+        runtime.apply(Command::AdvanceRace { to: 4 }).await.unwrap();
+        for at in 5..25 {
+            runtime
+                .apply(Command::SensorTriggered {
+                    lane: 1,
+                    edge: SignalEdge::Rising,
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+
+        let recovered = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+        let recovered = String::from_utf8_lossy(&recovered);
+        assert!(recovered.contains("id: 1:"));
+        assert!(recovered.contains("\"race_id\":\"new\""));
+        assert!(recovered.contains("\"race_generation\":1"));
+        assert!(recovered.contains("\"status\":\"active\""));
+    }
+}
+
+async fn finish_active(runtime: &RaceRuntime, at: u64) -> StateSnapshot {
+    runtime
+        .apply(Command::SensorTriggered {
+            lane: 1,
+            edge: SignalEdge::Rising,
+            at,
+        })
+        .await
+        .unwrap()
 }
 
 #[tokio::test]

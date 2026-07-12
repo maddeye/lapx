@@ -128,8 +128,9 @@ async fn debug_page_exposes_every_race_config_value() {
     ] {
         assert!(page.contains(value), "missing {value}");
     }
-    assert!(page.contains("snapshot.race_id === current.race_id"));
-    assert!(page.contains("snapshot.sequence === 0"));
+    assert!(page.contains("snapshot.race_generation < current.race_generation"));
+    assert!(page.contains("snapshot.race_generation === current.race_generation"));
+    assert!(page.contains("snapshot.sequence === current.sequence"));
     assert!(page.contains("current = snapshot"));
 }
 

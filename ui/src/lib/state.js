@@ -2,7 +2,7 @@
 // Injected globals keep this testable under node:test.
 
 /**
- * Single arbiter for server state: owns the sequence cursor, snapshot
+ * Single arbiter for server state: owns the generation/sequence cursor, snapshot
  * acceptance, connection status, and the monotonic receive timestamp.
  * All snapshot sources (initial fetch, SSE, POST responses) go through
  * accept(); nothing assigns snapshots directly.
@@ -10,7 +10,6 @@
 export function createStateClient(onChange, deps = {}) {
 	const now = deps.now ?? (() => performance.now());
 	let snapshot = null;
-	const seenRaceIds = new Set();
 	let connection = 'verbinde …';
 	let receivedAt = 0;
 	let connected = false;
@@ -21,23 +20,24 @@ export function createStateClient(onChange, deps = {}) {
 	return {
 		now,
 		accept(state, refresh = false) {
-			if (typeof state?.race_id !== 'string' || !state.race_id || typeof state.sequence !== 'number') {
-				return false;
-			}
+			if (
+				typeof state?.race_id !== 'string' ||
+				!state.race_id ||
+				!Number.isSafeInteger(state.race_generation) ||
+				state.race_generation < 0 ||
+				!Number.isSafeInteger(state.sequence) ||
+				state.sequence < 0
+			) return false;
 			if (snapshot) {
-				const sameRace = state.race_id === snapshot.race_id;
-				const terminal = snapshot.state?.status === 'finished' || snapshot.state?.status === 'aborted';
-				const nextRace =
-					terminal &&
-					!seenRaceIds.has(state.race_id) &&
-					((state.sequence === 0 && state.state?.status === 'ready') || refresh);
+				if (state.race_generation < snapshot.race_generation) return false;
 				if (
-					(sameRace && (state.sequence < snapshot.sequence || (state.sequence === snapshot.sequence && !refresh))) ||
-					(!sameRace && !nextRace)
+					state.race_generation === snapshot.race_generation &&
+					(state.race_id !== snapshot.race_id ||
+						state.sequence < snapshot.sequence ||
+						(state.sequence === snapshot.sequence && !refresh))
 				) return false;
 			}
 			snapshot = state;
-			seenRaceIds.add(state.race_id);
 			receivedAt = now();
 			emit();
 			return true;

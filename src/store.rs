@@ -77,20 +77,17 @@ pub struct EloSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub race_id: String,
+    pub race_generation: u64,
     pub sequence: u64,
     pub state: RaceState,
 }
 
 impl StateSnapshot {
     pub fn follows(&self, previous: &Self) -> bool {
-        if self.race_id == previous.race_id {
-            return self.sequence > previous.sequence;
+        if self.race_generation != previous.race_generation {
+            return self.race_generation > previous.race_generation;
         }
-        matches!(
-            previous.state.status,
-            RaceStatus::Finished(_) | RaceStatus::Aborted
-        ) && self.sequence == 0
-            && matches!(self.state.status, RaceStatus::Ready)
+        self.race_id == previous.race_id && self.sequence > previous.sequence
     }
 }
 
@@ -194,7 +191,8 @@ impl SqliteStore {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS current_race (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                race_id TEXT NOT NULL CHECK (length(trim(race_id)) > 0)
+                race_id TEXT NOT NULL CHECK (length(trim(race_id)) > 0),
+                generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0)
             );
             CREATE TABLE IF NOT EXISTS race_events (
                 race_id TEXT NOT NULL,
@@ -301,6 +299,7 @@ impl SqliteStore {
         events.extend(emitted);
         let snapshot = StateSnapshot {
             race_id: race_id.to_owned(),
+            race_generation: race_generation(&transaction, race_id)?,
             sequence: events.len() as u64,
             state: replay(&events)?.state().clone(),
         };
@@ -321,7 +320,7 @@ impl SqliteStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT OR IGNORE INTO current_race (singleton, race_id) VALUES (1, ?1)",
+            "INSERT OR IGNORE INTO current_race (singleton, race_id, generation) VALUES (1, ?1, 0)",
             [fallback_race_id],
         )?;
         let race_id: String = transaction.query_row(
@@ -389,7 +388,7 @@ impl SqliteStore {
             source,
         })?;
         transaction.execute(
-            "UPDATE current_race SET race_id = ?1 WHERE singleton = 1",
+            "UPDATE current_race SET race_id = ?1, generation = generation + 1 WHERE singleton = 1",
             [next_race_id],
         )?;
         let next = snapshot(&transaction, next_race_id)?;
@@ -703,9 +702,20 @@ fn snapshot(connection: &Connection, race_id: &str) -> Result<StateSnapshot, Sto
     let events = load_events(connection, race_id)?;
     Ok(StateSnapshot {
         race_id: race_id.to_owned(),
+        race_generation: race_generation(connection, race_id)?,
         sequence: events.len() as u64,
         state: replay(&events)?.state().clone(),
     })
+}
+
+fn race_generation(connection: &Connection, race_id: &str) -> Result<u64, StoreError> {
+    connection
+        .query_row(
+            "SELECT COALESCE((SELECT generation FROM current_race WHERE singleton = 1 AND race_id = ?1), 0)",
+            [race_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
 }
 
 fn load_events(connection: &Connection, race_id: &str) -> Result<Vec<Event>, StoreError> {

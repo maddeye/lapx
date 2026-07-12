@@ -47,7 +47,7 @@ const jsonResponse = (body, ok = true, status = 200) => ({
 });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
-const raceState = (sequence, fields = {}) => ({ race_id: 'race', sequence, state: {}, ...fields });
+const raceState = (sequence, fields = {}) => ({ race_id: 'race', race_generation: 0, sequence, state: {}, ...fields });
 
 function client(states = [], statuses = []) {
 	return createStateClient(
@@ -169,34 +169,51 @@ test('POST results feed the same arbiter: stale responses are dropped', async ()
 	assert.deepEqual(seen, [5, 6]);
 });
 
-test('client permits only a terminal-to-fresh-ready race cursor reset', () => {
+test('generation orders race switches without terminal or ready boundary heuristics', () => {
 	const seen = [];
-	const arbiter = createStateClient((next) => seen.push(`${next.snapshot.race_id}:${next.snapshot.sequence}`));
-	assert.equal(arbiter.accept({ race_id: 'old', sequence: 4, state: { status: 'active' } }), true);
-	assert.equal(arbiter.accept({ race_id: 'premature', sequence: 0, state: { status: 'ready' } }), false);
-	assert.equal(arbiter.accept({ race_id: 'old', sequence: 5, state: { status: 'finished' } }), true);
-	assert.equal(arbiter.accept({ race_id: 'premature', sequence: 2, state: { status: 'active' } }), false);
-	assert.equal(arbiter.accept({ race_id: 'new', sequence: 0, state: { status: 'ready' } }), true);
-	assert.equal(arbiter.accept({ race_id: 'new', sequence: 1, state: { status: 'finished' } }), true);
-	assert.equal(arbiter.accept({ race_id: 'old', sequence: 6, state: { status: 'finished' } }), false);
-	assert.deepEqual(seen, ['old:4', 'old:5', 'new:0', 'new:1']);
+	const arbiter = createStateClient((next) =>
+		seen.push(`${next.snapshot.race_generation}:${next.snapshot.race_id}:${next.snapshot.sequence}`)
+	);
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 4, sequence: 8, state: { status: 'active' } }), true);
+	assert.equal(arbiter.accept({ race_id: 'new', race_generation: 5, sequence: 3, state: { status: 'active' } }), true);
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 4, sequence: 99, state: { status: 'finished' } }, true), false);
+	assert.equal(arbiter.accept({ race_id: 'wrong', race_generation: 5, sequence: 4, state: {} }), false);
+	assert.equal(arbiter.accept({ race_id: 'new', race_generation: 5, sequence: 4, state: {} }), true);
+	// A greater generation is authoritative even if its race ID was seen before.
+	assert.equal(arbiter.accept({ race_id: 'old', race_generation: 6, sequence: 0, state: { status: 'ready' } }), true);
+	assert.deepEqual(seen, ['4:old:8', '5:new:3', '5:new:4', '6:old:0']);
 });
 
-test('reconnect may reload an unseen current race after its ready boundary was missed', () => {
-	const arbiter = createStateClient(() => {});
-	arbiter.accept({ race_id: 'old', sequence: 5, state: { status: 'finished' } });
-	assert.equal(
-		arbiter.accept({ race_id: 'new', sequence: 3, state: { status: 'active' } }),
-		false
-	);
-	assert.equal(
-		arbiter.accept({ race_id: 'new', sequence: 3, state: { status: 'active' } }, true),
-		true
-	);
-	assert.equal(
-		arbiter.accept({ race_id: 'old', sequence: 6, state: { status: 'finished' } }, true),
-		false
-	);
+test('reconnect accepts a greater generation after the switch boundary was missed', async () => {
+	let latest = null;
+	const arbiter = createStateClient((next) => (latest = next));
+	connectState(arbiter, {
+		fetch: async () =>
+			jsonResponse({ race_id: 'old', race_generation: 7, sequence: 8, state: { status: 'active' } }),
+		EventSource: FakeEventSource
+	});
+	await settle();
+	const source = FakeEventSource.last;
+	source.onopen();
+	source.emit('state', { race_id: 'new', race_generation: 8, sequence: 3, state: { status: 'active' } });
+	assert.equal(latest.snapshot.race_id, 'new');
+	assert.equal(latest.snapshot.race_generation, 8);
+});
+
+test('delayed lower-generation fetch and POST responses cannot regress state', async () => {
+	let latest = null;
+	let resolveFetch;
+	const arbiter = createStateClient((next) => (latest = next));
+	const stream = connectState(arbiter, {
+		fetch: () => new Promise((resolve) => (resolveFetch = resolve)),
+		EventSource: FakeEventSource
+	});
+	FakeEventSource.last.emit('state', { race_id: 'new', race_generation: 2, sequence: 1, state: {} });
+	assert.equal(stream.accept({ race_id: 'old', race_generation: 1, sequence: 100, state: {} }), false);
+	resolveFetch(jsonResponse({ race_id: 'old', race_generation: 1, sequence: 100, state: {} }));
+	await settle();
+	assert.equal(latest.snapshot.race_id, 'new');
+	assert.equal(latest.snapshot.race_generation, 2);
 });
 
 test('client uses injected monotonic time for receivedAt', () => {
