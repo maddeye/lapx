@@ -116,7 +116,7 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Optional administration
 
-- [ ] **Delivery 22 — [Fahrer CRUD](.plans/best-path/slice-22.html)**
+- [x] **Delivery 22 — [Fahrer CRUD](.plans/best-path/slice-22.html)**
   - Add stable Fahrer identities with list, create, rename, and archive operations.
   - Verify: `cargo test driver_crud_round_trip`.
 
