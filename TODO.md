@@ -102,15 +102,15 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 
 ## Safe production UI
 
-- [ ] **Delivery 19 — [Public read-only binding](.plans/best-path/slice-19.html)**
+- [x] **Delivery 19 — [Public read-only binding](.plans/best-path/slice-19.html)**
   - Separate local mutating routes from public state, SSE, and display routes.
   - Verify: `cargo test public_api_is_read_only`.
 
-- [ ] **Delivery 20 — [Rennscreen](.plans/best-path/slice-20.html)**
+- [x] **Delivery 20 — [Rennscreen](.plans/best-path/slice-20.html)**
   - Build one static SvelteKit fullscreen display and serve its assets from Rust.
   - Verify: `npm test` and `cargo test serves_static_rennscreen`.
 
-- [ ] **Delivery 21 — [Local Rennleiter UI](.plans/best-path/slice-21.html)**
+- [x] **Delivery 21 — [Local Rennleiter UI](.plans/best-path/slice-21.html)**
   - Add local production controls over existing commands; keep `/control` unavailable publicly.
   - Verify: UI smoke test, complete-race walkthrough, and public `/control` rejection.
 
