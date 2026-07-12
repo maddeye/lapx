@@ -128,7 +128,7 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
   - Add tournaments, ordered heats, lane assignments, and links to authoritative race ids.
   - Verify: `cargo test manual_tournament_flow`.
 
-- [ ] **Delivery 25 — [Elo](.plans/best-path/slice-24.html)**
+- [x] **Delivery 25 — [Elo](.plans/best-path/slice-24.html)**
   - Derive deterministic pairwise multi-lane Elo and rebuild later ratings after corrections.
   - Verify: `cargo test elo_is_reproducible correction_rebuilds_later_elo`.
 
