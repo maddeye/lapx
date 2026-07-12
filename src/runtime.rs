@@ -189,6 +189,7 @@ pub struct RaceRuntime {
     ingress: mpsc::UnboundedSender<Ingress>,
     shared: Arc<Shared>,
     hardware: Option<HardwareRuntime>,
+    store: SqliteStore,
 }
 
 enum CommandRequest {
@@ -226,6 +227,7 @@ impl RaceRuntime {
             ingress,
             shared: shared.clone(),
             hardware: None,
+            store: store.clone(),
         });
         Dispatcher::spawn(store, race_id, initial, receiver, shared, None);
         Ok(runtime)
@@ -289,6 +291,7 @@ impl RaceRuntime {
                 monitor: monitor.clone(),
                 _timing: StdMutex::new(Box::new(timing)),
             }),
+            store: store.clone(),
         });
         Dispatcher::spawn(
             store,
@@ -304,6 +307,10 @@ impl RaceRuntime {
             }),
         );
         Ok(runtime)
+    }
+
+    pub(crate) fn store(&self) -> SqliteStore {
+        self.store.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateSnapshot> {
