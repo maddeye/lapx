@@ -132,7 +132,7 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
   - Derive deterministic pairwise multi-lane Elo and rebuild later ratings after corrections.
   - Verify: `cargo test elo_is_reproducible correction_rebuilds_later_elo`.
 
-- [ ] **Delivery 26 — [Generated tournaments](.plans/best-path/slice-26.html)**
+- [x] **Delivery 26 — [Generated tournaments](.plans/best-path/slice-26.html)**
   - Add deterministic seeded random heat generation, then Elo-balanced snake distribution.
   - Verify: `cargo test tournament_generation_is_deterministic`.
 
