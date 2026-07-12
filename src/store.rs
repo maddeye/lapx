@@ -45,6 +45,30 @@ pub struct DriverStats {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloRating {
+    pub driver_id: i64,
+    pub rating: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloDelta {
+    pub driver_id: i64,
+    pub delta: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloRaceDelta {
+    pub race_id: String,
+    pub deltas: Vec<EloDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloSummary {
+    pub ratings: Vec<EloRating>,
+    pub races: Vec<EloRaceDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeatAssignment {
     pub lane: u8,
     pub driver_id: i64,
@@ -364,6 +388,76 @@ impl SqliteStore {
         Ok(stats.into_values().collect())
     }
 
+    pub fn elo(&self) -> Result<EloSummary, StoreError> {
+        let mut ratings: BTreeMap<_, _> = self
+            .drivers()?
+            .into_iter()
+            .map(|driver| (driver.id, 1500))
+            .collect();
+        let mut completed = self.completed_races()?;
+        // History is newest-first; Elo folds the durable completion order oldest-first.
+        completed.reverse();
+        let mut races = Vec::with_capacity(completed.len());
+
+        for race in completed {
+            let participants: Vec<_> = race
+                .results
+                .iter()
+                .filter(|result| result.driver_id.is_some())
+                .collect();
+            let mut deltas = if participants.len() < 2 {
+                Vec::new()
+            } else {
+                participants
+                    .iter()
+                    .map(|result| {
+                        let driver_id = result.driver_id.expect("assigned Fahrer has an id");
+                        let rating = *ratings.get(&driver_id).unwrap_or(&1500);
+                        let opponents = (participants.len() - 1) as f64;
+                        let (actual, expected) = participants
+                            .iter()
+                            .filter(|other| other.driver_id != result.driver_id)
+                            .fold((0.0, 0.0), |(actual, expected), other| {
+                                let other_rating = *ratings
+                                    .get(&other.driver_id.expect("assigned Fahrer has an id"))
+                                    .unwrap_or(&1500);
+                                (
+                                    actual + actual_score(result, other),
+                                    expected
+                                        + 1.0
+                                            / (1.0
+                                                + 10f64
+                                                    .powf((other_rating - rating) as f64 / 400.0)),
+                                )
+                            });
+                        EloDelta {
+                            driver_id,
+                            // Average first, then deterministically round the race delta once.
+                            delta: (32.0 * (actual / opponents - expected / opponents)).round()
+                                as i64,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            deltas.sort_by_key(|delta| delta.driver_id);
+            for delta in &deltas {
+                *ratings.entry(delta.driver_id).or_insert(1500) += delta.delta;
+            }
+            races.push(EloRaceDelta {
+                race_id: race.race_id,
+                deltas,
+            });
+        }
+
+        Ok(EloSummary {
+            ratings: ratings
+                .into_iter()
+                .map(|(driver_id, rating)| EloRating { driver_id, rating })
+                .collect(),
+            races,
+        })
+    }
+
     pub fn tournaments(&self) -> Result<Vec<Tournament>, StoreError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
@@ -537,6 +631,20 @@ impl SqliteStore {
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
+    }
+}
+
+fn actual_score(result: &RaceResult, other: &RaceResult) -> f64 {
+    let metric = |result: &RaceResult| {
+        (
+            std::cmp::Reverse(result.corrected_laps_thousandths),
+            result.result_time_ms.unwrap_or(u64::MAX),
+        )
+    };
+    match metric(result).cmp(&metric(other)) {
+        std::cmp::Ordering::Less => 1.0,
+        std::cmp::Ordering::Equal => 0.5,
+        std::cmp::Ordering::Greater => 0.0,
     }
 }
 

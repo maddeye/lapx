@@ -82,6 +82,7 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 	};
 	const body = await renderPage('/src/routes/admin/+page.svelte', {
 		initialDrivers: [{ id: 7, display_name: 'Ada', archived_at: null }],
+		initialElo: { ratings: [{ driver_id: 7, rating: 1516 }], races: [] },
 		initialTournaments: [tournament],
 		initialSelectedTournament: tournament
 	});
@@ -92,6 +93,8 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 		'Anlegen',
 		'Fahrerliste',
 		'Ada',
+		'Elo',
+		'1516',
 		'Umbenennen',
 		'Archivieren',
 		'Turniere',
