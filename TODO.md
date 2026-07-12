@@ -5,11 +5,11 @@ Complete these in order. Keep each change limited to its linked slice; do not pu
 ## Completion rules
 
 - [ ] Implement every delivery item below in order.
-- [ ] Keep `RaceEngine` independent of UI, transport, storage, and hardware.
-- [ ] Commit race-relevant events to the SQLite **Rennprotokoll** before exposing their state.
-- [ ] Add only the smallest runnable check named by each slice.
-- [ ] Run all existing checks after every delivery item.
-- [ ] Keep the linked HTML plan current if implementation discoveries change the path.
+- [x] Keep `RaceEngine` independent of UI, transport, storage, and hardware.
+- [x] Commit race-relevant events to the SQLite **Rennprotokoll** before exposing their state.
+- [x] Add only the smallest runnable check named by each slice.
+- [x] Run all existing checks after every delivery item.
+- [x] Keep the linked HTML plan current if implementation discoveries change the path.
 - [ ] Finish with all Rust, UI, integration, and Raspberry Pi hardware checks passing.
 
 ## Foundation
