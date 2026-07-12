@@ -45,6 +45,30 @@ pub struct DriverStats {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloRating {
+    pub driver_id: i64,
+    pub rating: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloDelta {
+    pub driver_id: i64,
+    pub delta: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloRaceDelta {
+    pub race_id: String,
+    pub deltas: Vec<EloDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EloSummary {
+    pub ratings: Vec<EloRating>,
+    pub races: Vec<EloRaceDelta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeatAssignment {
     pub lane: u8,
     pub driver_id: i64,
@@ -290,53 +314,13 @@ impl SqliteStore {
 
     pub fn drivers(&self) -> Result<Vec<Driver>, StoreError> {
         let connection = self.connect()?;
-        let mut statement =
-            connection.prepare("SELECT id, display_name, archived_at FROM drivers ORDER BY id")?;
-        let rows = statement.query_map([], driver_from_row)?;
-        rows.collect::<Result<_, _>>().map_err(StoreError::from)
+        load_drivers(&connection)
     }
 
     pub fn completed_races(&self) -> Result<Vec<CompletedRace>, StoreError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
-        let race_ids = {
-            let mut statement = transaction.prepare(
-                "SELECT race_id
-                 FROM race_events
-                 GROUP BY race_id
-                 HAVING SUM(event_type = 'race_finished') > 0
-                 ORDER BY MAX(CASE WHEN event_type = 'race_finished' THEN rowid END) DESC",
-            )?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut races = Vec::new();
-        for race_id in race_ids {
-            let events = load_events(&transaction, &race_id)?;
-            let state = replay(&events)?.state().clone();
-            if let RaceStatus::Finished(finished) = &state.status {
-                let results = state
-                    .standings()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, standing)| RaceResult {
-                        position: index as u8 + 1,
-                        lane: standing.lane,
-                        driver_id: finished.config.driver_ids[standing.lane as usize - 1],
-                        corrected_laps_thousandths: standing.corrected_laps_thousandths,
-                        result_time_ms: standing.result_time_ms,
-                        best_lap_ms: state.lane(standing.lane).and_then(|lane| lane.best_lap_ms),
-                    })
-                    .collect();
-                races.push(CompletedRace {
-                    race_id,
-                    official_start_at: finished.official_start_at,
-                    finished_at: finished.finished_at,
-                    results,
-                });
-            }
-        }
+        let races = load_completed_races(&transaction)?;
         transaction.commit()?;
         Ok(races)
     }
@@ -362,6 +346,79 @@ impl SqliteStore {
             }
         }
         Ok(stats.into_values().collect())
+    }
+
+    pub fn elo(&self) -> Result<EloSummary, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let mut ratings: BTreeMap<_, _> = load_drivers(&transaction)?
+            .into_iter()
+            .map(|driver| (driver.id, 1500))
+            .collect();
+        let mut completed = load_completed_races(&transaction)?;
+        // History is newest-first; Elo folds the durable completion order oldest-first.
+        completed.reverse();
+        let mut races = Vec::with_capacity(completed.len());
+
+        for race in completed {
+            let participants: Vec<_> = race
+                .results
+                .iter()
+                .filter(|result| result.driver_id.is_some())
+                .collect();
+            let mut deltas = if participants.len() < 2 {
+                Vec::new()
+            } else {
+                participants
+                    .iter()
+                    .map(|result| {
+                        let driver_id = result.driver_id.expect("assigned Fahrer has an id");
+                        let rating = *ratings.get(&driver_id).unwrap_or(&1500);
+                        let opponents = (participants.len() - 1) as f64;
+                        let (actual, expected) = participants
+                            .iter()
+                            .filter(|other| other.driver_id != result.driver_id)
+                            .fold((0.0, 0.0), |(actual, expected), other| {
+                                let other_rating = *ratings
+                                    .get(&other.driver_id.expect("assigned Fahrer has an id"))
+                                    .unwrap_or(&1500);
+                                (
+                                    actual + actual_score(result, other),
+                                    expected
+                                        + 1.0
+                                            / (1.0
+                                                + 10f64
+                                                    .powf((other_rating - rating) as f64 / 400.0)),
+                                )
+                            });
+                        EloDelta {
+                            driver_id,
+                            // Average first, then deterministically round the race delta once.
+                            delta: (32.0 * (actual / opponents - expected / opponents)).round()
+                                as i64,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            deltas.sort_by_key(|delta| delta.driver_id);
+            for delta in &deltas {
+                *ratings.entry(delta.driver_id).or_insert(1500) += delta.delta;
+            }
+            races.push(EloRaceDelta {
+                race_id: race.race_id,
+                deltas,
+            });
+        }
+
+        let summary = EloSummary {
+            ratings: ratings
+                .into_iter()
+                .map(|(driver_id, rating)| EloRating { driver_id, rating })
+                .collect(),
+            races,
+        };
+        transaction.commit()?;
+        Ok(summary)
     }
 
     pub fn tournaments(&self) -> Result<Vec<Tournament>, StoreError> {
@@ -537,6 +594,71 @@ impl SqliteStore {
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
+    }
+}
+
+fn load_drivers(connection: &Connection) -> Result<Vec<Driver>, StoreError> {
+    let mut statement =
+        connection.prepare("SELECT id, display_name, archived_at FROM drivers ORDER BY id")?;
+    statement
+        .query_map([], driver_from_row)?
+        .collect::<Result<_, _>>()
+        .map_err(StoreError::from)
+}
+
+fn load_completed_races(connection: &Connection) -> Result<Vec<CompletedRace>, StoreError> {
+    let race_ids = {
+        let mut statement = connection.prepare(
+            "SELECT race_id
+             FROM race_events
+             GROUP BY race_id
+             HAVING SUM(event_type = 'race_finished') > 0
+             ORDER BY MAX(CASE WHEN event_type = 'race_finished' THEN rowid END) DESC",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut races = Vec::new();
+    for race_id in race_ids {
+        let events = load_events(connection, &race_id)?;
+        let state = replay(&events)?.state().clone();
+        if let RaceStatus::Finished(finished) = &state.status {
+            let results = state
+                .standings()
+                .into_iter()
+                .enumerate()
+                .map(|(index, standing)| RaceResult {
+                    position: index as u8 + 1,
+                    lane: standing.lane,
+                    driver_id: finished.config.driver_ids[standing.lane as usize - 1],
+                    corrected_laps_thousandths: standing.corrected_laps_thousandths,
+                    result_time_ms: standing.result_time_ms,
+                    best_lap_ms: state.lane(standing.lane).and_then(|lane| lane.best_lap_ms),
+                })
+                .collect();
+            races.push(CompletedRace {
+                race_id,
+                official_start_at: finished.official_start_at,
+                finished_at: finished.finished_at,
+                results,
+            });
+        }
+    }
+    Ok(races)
+}
+
+fn actual_score(result: &RaceResult, other: &RaceResult) -> f64 {
+    let metric = |result: &RaceResult| {
+        (
+            std::cmp::Reverse(result.corrected_laps_thousandths),
+            result.result_time_ms.unwrap_or(u64::MAX),
+        )
+    };
+    match metric(result).cmp(&metric(other)) {
+        std::cmp::Ordering::Less => 1.0,
+        std::cmp::Ordering::Equal => 0.5,
+        std::cmp::Ordering::Greater => 0.0,
     }
 }
 
@@ -796,5 +918,20 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert_eq!(synchronous, 2); // SQLite FULL
         assert!(foreign_keys);
+    }
+
+    #[test]
+    fn elo_read_helpers_share_one_snapshot() {
+        let dir = tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
+        store.create_driver("Ada").unwrap();
+
+        let mut connection = store.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert_eq!(load_drivers(&transaction).unwrap().len(), 1);
+        store.create_driver("Grace").unwrap();
+        assert_eq!(load_drivers(&transaction).unwrap().len(), 1);
+        transaction.commit().unwrap();
+        assert_eq!(store.drivers().unwrap().len(), 2);
     }
 }

@@ -2,7 +2,9 @@ use crate::{
     domain::{ChaosSource, Command, RaceConfig, SignalEdge},
     hardware::HardwareSnapshot,
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
-    store::{CompletedRace, Driver, DriverStats, HeatAssignment, StoreError, Tournament},
+    store::{
+        CompletedRace, Driver, DriverStats, EloSummary, HeatAssignment, StoreError, Tournament,
+    },
 };
 use async_stream::stream;
 use axum::{
@@ -40,6 +42,7 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/drivers", get(drivers).post(create_driver))
         .route("/api/race-history", get(race_history))
         .route("/api/driver-stats", get(driver_stats))
+        .route("/api/elo", get(elo))
         .route("/api/tournaments", get(tournaments).post(create_tournament))
         .route("/api/tournaments/{id}", get(tournament))
         .route("/api/tournaments/{id}/heats", post(append_heat))
@@ -142,6 +145,11 @@ async fn driver_stats(
 ) -> Result<Json<Vec<DriverStats>>, HttpError> {
     let store = runtime.store();
     Ok(Json(store_task(move || store.driver_stats()).await?))
+}
+
+async fn elo(State(runtime): State<Arc<RaceRuntime>>) -> Result<Json<EloSummary>, HttpError> {
+    let store = runtime.store();
+    Ok(Json(store_task(move || store.elo()).await?))
 }
 
 async fn tournaments(

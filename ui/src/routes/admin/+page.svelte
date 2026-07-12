@@ -2,11 +2,18 @@
 	import { onMount } from 'svelte';
 	import { formatLaps, formatMs } from '$lib/state.js';
 
-	let { initialDrivers = [], initialTournaments = [], initialSelectedTournament = null } = $props();
+	let {
+		initialDrivers = [],
+		initialElo = { ratings: [], races: [] },
+		initialTournaments = [],
+		initialSelectedTournament = null
+	} = $props();
 	// svelte-ignore state_referenced_locally
 	let drivers = $state(initialDrivers);
 	let history = $state([]);
 	let stats = $state([]);
+	// svelte-ignore state_referenced_locally
+	let elo = $state(initialElo);
 	// svelte-ignore state_referenced_locally
 	let tournaments = $state(initialTournaments);
 	// svelte-ignore state_referenced_locally
@@ -42,14 +49,16 @@
 	}
 
 	const load = () => run(async () => {
-		[drivers, history, stats, tournaments] = await Promise.all([
+		[drivers, history, stats, elo, tournaments] = await Promise.all([
 			request('/api/drivers'),
 			request('/api/race-history'),
 			request('/api/driver-stats'),
+			request('/api/elo'),
 			request('/api/tournaments')
 		]);
 	});
 	const driverName = (id) => drivers.find((driver) => driver.id === id)?.display_name ?? `Fahrer ${id}`;
+	const eloRating = (id) => elo.ratings.find((rating) => rating.driver_id === id)?.rating ?? 1500;
 	const activeDrivers = $derived(drivers.filter((driver) => driver.archived_at === null));
 	function selectTournament(tournament) {
 		selectedTournament = tournament;
@@ -117,20 +126,26 @@
 		{#if drivers.length === 0}
 			<p>Keine Fahrer vorhanden.</p>
 		{:else}
-			<ul>
-				{#each drivers as driver (driver.id)}
-					<li>
-						<form onsubmit={(event) => (event.preventDefault(), rename(driver.id, event))}>
-							<label>Name
-								<input name="display_name" required value={driver.display_name} />
-							</label>
-							<button type="submit" disabled={pending}>Umbenennen</button>
-							<button type="button" disabled={pending || driver.archived_at !== null} onclick={() => archive(driver.id)}>Archivieren</button>
-							{#if driver.archived_at !== null}<span>Archiviert</span>{/if}
-						</form>
-					</li>
-				{/each}
-			</ul>
+			<table>
+				<thead><tr><th>Fahrer</th><th>Elo</th></tr></thead>
+				<tbody>
+					{#each drivers as driver (driver.id)}
+						<tr>
+							<td>
+								<form onsubmit={(event) => (event.preventDefault(), rename(driver.id, event))}>
+									<label>Name
+										<input name="display_name" required value={driver.display_name} />
+									</label>
+									<button type="submit" disabled={pending}>Umbenennen</button>
+									<button type="button" disabled={pending || driver.archived_at !== null} onclick={() => archive(driver.id)}>Archivieren</button>
+									{#if driver.archived_at !== null}<span>Archiviert</span>{/if}
+								</form>
+							</td>
+							<td>{eloRating(driver.id)}</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
 		{/if}
 	</section>
 
