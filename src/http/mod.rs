@@ -126,7 +126,7 @@ struct GeneratedTournamentInput {
     driver_ids: Vec<i64>,
     lane_count: u8,
     mode: TournamentGenerationMode,
-    seed: u64,
+    seed: String,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +194,16 @@ async fn generate_tournament(
     input: Result<Json<GeneratedTournamentInput>, JsonRejection>,
 ) -> Result<Json<Tournament>, HttpError> {
     let input = parse(input)?;
+    let seed = input
+        .seed
+        .parse::<u64>()
+        .ok()
+        .filter(|_| input.seed.bytes().all(|digit| digit.is_ascii_digit()))
+        .ok_or_else(|| {
+            HttpError::Malformed(
+                "seed must be a decimal string from 0 to 18446744073709551615".into(),
+            )
+        })?;
     let store = runtime.store();
     Ok(Json(
         store_task(move || {
@@ -202,7 +212,7 @@ async fn generate_tournament(
                 &input.driver_ids,
                 input.lane_count,
                 input.mode,
-                input.seed,
+                seed,
             )
         })
         .await?,

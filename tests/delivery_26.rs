@@ -47,7 +47,7 @@ async fn generated(
                 "driver_ids": driver_ids,
                 "lane_count": lane_count,
                 "mode": mode,
-                "seed": seed,
+                "seed": seed.to_string(),
             }),
         ),
     )
@@ -176,6 +176,24 @@ async fn tournament_generation_is_deterministic() {
     assert_eq!(random.generation.as_ref().unwrap().lane_count, 3);
     assert_valid_heats(&random, &drivers, 3);
 
+    let (status, body) = response(
+        &app,
+        post(
+            "/api/tournaments/generate",
+            serde_json::json!({
+                "name": "Leading zero seed",
+                "driver_ids": drivers[..2],
+                "lane_count": 2,
+                "mode": "random",
+                "seed": format!("000{}", u64::MAX),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let leading_zero_seed: Tournament = serde_json::from_slice(&body).unwrap();
+    assert_eq!(leading_zero_seed.generation.unwrap().seed, u64::MAX);
+
     let elo = generated(
         &app,
         "Elo Cup",
@@ -221,16 +239,39 @@ async fn tournament_generation_is_deterministic() {
     assert_eq!(fetched.generation, random.generation);
 
     let before_failures = store.tournaments().unwrap().len();
+    for seed in [
+        serde_json::json!(0),
+        serde_json::json!("18446744073709551616"),
+        serde_json::json!("-1"),
+        serde_json::json!("+1"),
+        serde_json::json!("not-decimal"),
+    ] {
+        let body = serde_json::json!({
+            "name": "Invalid wire seed",
+            "driver_ids": drivers[..2],
+            "lane_count": 2,
+            "mode": "random",
+            "seed": seed,
+        });
+        assert_eq!(
+            response(&app, post("/api/tournaments/generate", body))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.tournaments().unwrap().len(), before_failures);
+    }
+
     let archived = store.create_driver("Archived").unwrap();
     store.archive_driver(archived.id).unwrap();
     for body in [
-        serde_json::json!({ "name": "one", "driver_ids": [drivers[0]], "lane_count": 2, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "duplicate", "driver_ids": [drivers[0], drivers[0]], "lane_count": 2, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "zero lanes", "driver_ids": drivers[..2], "lane_count": 0, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "five lanes", "driver_ids": drivers[..2], "lane_count": 5, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "archived", "driver_ids": [drivers[0], archived.id], "lane_count": 2, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "", "driver_ids": drivers[..2], "lane_count": 2, "mode": "random", "seed": 0 }),
-        serde_json::json!({ "name": "bad mode", "driver_ids": drivers[..2], "lane_count": 2, "mode": "swiss", "seed": 0 }),
+        serde_json::json!({ "name": "one", "driver_ids": [drivers[0]], "lane_count": 2, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "duplicate", "driver_ids": [drivers[0], drivers[0]], "lane_count": 2, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "zero lanes", "driver_ids": drivers[..2], "lane_count": 0, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "five lanes", "driver_ids": drivers[..2], "lane_count": 5, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "archived", "driver_ids": [drivers[0], archived.id], "lane_count": 2, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "", "driver_ids": drivers[..2], "lane_count": 2, "mode": "random", "seed": "0" }),
+        serde_json::json!({ "name": "bad mode", "driver_ids": drivers[..2], "lane_count": 2, "mode": "swiss", "seed": "0" }),
     ] {
         assert_eq!(
             response(&app, post("/api/tournaments/generate", body))
@@ -267,7 +308,7 @@ async fn tournament_generation_is_deterministic() {
             &app,
             post(
                 "/api/tournaments/generate",
-                serde_json::json!({ "name": "Atomic", "driver_ids": drivers[..2], "lane_count": 2, "mode": "random", "seed": 0 }),
+                serde_json::json!({ "name": "Atomic", "driver_ids": drivers[..2], "lane_count": 2, "mode": "random", "seed": "0" }),
             ),
         )
         .await

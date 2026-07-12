@@ -34,7 +34,7 @@
 		const response = await fetch(path, {
 			method: body === undefined ? 'GET' : 'POST',
 			headers: body === undefined ? {} : { 'content-type': 'application/json' },
-			body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body)
+			body: body === undefined ? undefined : JSON.stringify(body)
 		});
 		if (!response.ok) throw new Error((await response.text()) || `Fehler ${response.status}`);
 		return response.json();
@@ -93,8 +93,13 @@
 		if (!/^\d+$/.test(generatedSeed) || BigInt(generatedSeed) > 18446744073709551615n) {
 			throw new Error('Seed muss eine Zahl von 0 bis 18446744073709551615 sein');
 		}
-		const body = `{"name":${JSON.stringify(generatedName)},"driver_ids":${JSON.stringify(generatedDriverIds)},"lane_count":${generatedLanes},"mode":${JSON.stringify(generatedMode)},"seed":${generatedSeed}}`;
-		const tournament = await request('/api/tournaments/generate', body);
+		const tournament = await request('/api/tournaments/generate', {
+			name: generatedName,
+			driver_ids: generatedDriverIds,
+			lane_count: generatedLanes,
+			mode: generatedMode,
+			seed: generatedSeed
+		});
 		tournaments = [...tournaments, tournament];
 		selectedTournament = tournament;
 		generatedName = '';
