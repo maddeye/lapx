@@ -2,7 +2,7 @@ use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState, RaceStat
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     ops::Deref,
     path::{Path, PathBuf},
@@ -42,6 +42,28 @@ pub struct DriverStats {
     pub starts: u64,
     pub wins: u64,
     pub best_lap_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatAssignment {
+    pub lane: u8,
+    pub driver_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentHeat {
+    pub id: i64,
+    pub position: u64,
+    pub assignments: Vec<HeatAssignment>,
+    pub race_id: Option<String>,
+    pub results: Option<Vec<RaceResult>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tournament {
+    pub id: i64,
+    pub name: String,
+    pub heats: Vec<TournamentHeat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +108,15 @@ pub enum StoreError {
     InvalidDriverName,
     DriverNotFound(i64),
     DriverNotActive(i64),
+    InvalidTournamentName,
+    TournamentNotFound(i64),
+    HeatNotFound(i64),
+    InvalidHeatAssignments,
+    TournamentFrozen(i64),
+    HeatAlreadyLinked(i64),
+    RaceNotFound(String),
+    RaceAlreadyLinked(String),
+    RaceAssignmentsMismatch,
     CorruptProtocol(String),
 }
 
@@ -148,7 +179,37 @@ impl SqliteStore {
                 id INTEGER PRIMARY KEY,
                 display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
                 archived_at INTEGER
-            );"
+            );
+            CREATE TABLE IF NOT EXISTS tournaments (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL CHECK (length(trim(name)) > 0)
+            );
+            CREATE TABLE IF NOT EXISTS tournament_heats (
+                id INTEGER PRIMARY KEY,
+                tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                position INTEGER NOT NULL CHECK (position > 0),
+                race_id TEXT UNIQUE,
+                UNIQUE (tournament_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS tournament_heat_assignments (
+                heat_id INTEGER NOT NULL REFERENCES tournament_heats(id),
+                lane INTEGER NOT NULL CHECK (lane BETWEEN 1 AND 4),
+                driver_id INTEGER NOT NULL REFERENCES drivers(id),
+                PRIMARY KEY (heat_id, lane),
+                UNIQUE (heat_id, driver_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS tournament_heat_order_immutable
+            BEFORE UPDATE OF tournament_id, position ON tournament_heats
+            BEGIN SELECT RAISE(ABORT, 'tournament heat order is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS tournament_heats_no_delete
+            BEFORE DELETE ON tournament_heats
+            BEGIN SELECT RAISE(ABORT, 'tournament heats are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS tournament_assignments_no_update
+            BEFORE UPDATE ON tournament_heat_assignments
+            BEGIN SELECT RAISE(ABORT, 'tournament heat assignments are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS tournament_assignments_no_delete
+            BEFORE DELETE ON tournament_heat_assignments
+            BEGIN SELECT RAISE(ABORT, 'tournament heat assignments are immutable'); END;"
         )?;
         Ok(store)
     }
@@ -303,6 +364,138 @@ impl SqliteStore {
         Ok(stats.into_values().collect())
     }
 
+    pub fn tournaments(&self) -> Result<Vec<Tournament>, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let ids = {
+            let mut statement = transaction.prepare("SELECT id FROM tournaments ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let tournaments = ids
+            .into_iter()
+            .map(|id| load_tournament(&transaction, id))
+            .collect::<Result<_, _>>()?;
+        transaction.commit()?;
+        Ok(tournaments)
+    }
+
+    pub fn tournament(&self, id: i64) -> Result<Tournament, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let tournament = load_tournament(&transaction, id)?;
+        transaction.commit()?;
+        Ok(tournament)
+    }
+
+    pub fn create_tournament(&self, name: &str) -> Result<Tournament, StoreError> {
+        let name = tournament_name(name)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("INSERT INTO tournaments (name) VALUES (?1)", [name])?;
+        let id = transaction.last_insert_rowid();
+        let tournament = load_tournament(&transaction, id)?;
+        transaction.commit()?;
+        Ok(tournament)
+    }
+
+    pub fn append_heat(
+        &self,
+        tournament_id: i64,
+        assignments: &[HeatAssignment],
+    ) -> Result<Tournament, StoreError> {
+        validate_heat_assignments(assignments)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_tournament(&transaction, tournament_id)?;
+        if tournament_started(&transaction, tournament_id)? {
+            return Err(StoreError::TournamentFrozen(tournament_id));
+        }
+        validate_active_drivers(
+            &transaction,
+            &assignments
+                .iter()
+                .map(|assignment| Some(assignment.driver_id))
+                .collect::<Vec<_>>(),
+        )?;
+        let position: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM tournament_heats WHERE tournament_id = ?1",
+            [tournament_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO tournament_heats (tournament_id, position) VALUES (?1, ?2)",
+            params![tournament_id, position],
+        )?;
+        let heat_id = transaction.last_insert_rowid();
+        for assignment in assignments {
+            transaction.execute(
+                "INSERT INTO tournament_heat_assignments (heat_id, lane, driver_id) VALUES (?1, ?2, ?3)",
+                params![heat_id, assignment.lane, assignment.driver_id],
+            )?;
+        }
+        let tournament = load_tournament(&transaction, tournament_id)?;
+        transaction.commit()?;
+        Ok(tournament)
+    }
+
+    pub fn link_heat(
+        &self,
+        tournament_id: i64,
+        heat_id: i64,
+        race_id: &str,
+    ) -> Result<Tournament, StoreError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_tournament(&transaction, tournament_id)?;
+        let linked: Option<String> = transaction
+            .query_row(
+                "SELECT race_id FROM tournament_heats WHERE id = ?1 AND tournament_id = ?2",
+                params![heat_id, tournament_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::HeatNotFound(heat_id),
+                error => StoreError::Sqlite(error),
+            })?;
+        if linked.is_some() {
+            return Err(StoreError::HeatAlreadyLinked(heat_id));
+        }
+        let already_linked: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tournament_heats WHERE race_id = ?1)",
+            [race_id],
+            |row| row.get(0),
+        )?;
+        if already_linked {
+            return Err(StoreError::RaceAlreadyLinked(race_id.to_owned()));
+        }
+        let events = load_events(&transaction, race_id)?;
+        let config = events
+            .iter()
+            .find_map(|event| match event {
+                Event::RaceConfigured { config, .. } => Some(config),
+                _ => None,
+            })
+            .ok_or_else(|| StoreError::RaceNotFound(race_id.to_owned()))?;
+        let assignments = load_assignments(&transaction, heat_id)?;
+        let expected: Vec<_> = assignments
+            .iter()
+            .map(|assignment| Some(assignment.driver_id))
+            .collect();
+        if config.lanes as usize != assignments.len() || config.driver_ids != expected {
+            return Err(StoreError::RaceAssignmentsMismatch);
+        }
+        replay(&events)?;
+        transaction.execute(
+            "UPDATE tournament_heats SET race_id = ?1 WHERE id = ?2",
+            params![race_id, heat_id],
+        )?;
+        let tournament = load_tournament(&transaction, tournament_id)?;
+        transaction.commit()?;
+        Ok(tournament)
+    }
+
     pub fn create_driver(&self, display_name: &str) -> Result<Driver, StoreError> {
         let display_name = driver_name(display_name)?;
         let connection = self.connect()?;
@@ -341,9 +534,154 @@ impl SqliteStore {
     fn connect(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_millis(50))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
+}
+
+fn tournament_name(name: &str) -> Result<&str, StoreError> {
+    let name = name.trim();
+    if name.is_empty() {
+        Err(StoreError::InvalidTournamentName)
+    } else {
+        Ok(name)
+    }
+}
+
+fn validate_heat_assignments(assignments: &[HeatAssignment]) -> Result<(), StoreError> {
+    let lanes: BTreeSet<_> = assignments
+        .iter()
+        .map(|assignment| assignment.lane)
+        .collect();
+    if assignments.is_empty()
+        || assignments.len() > 4
+        || lanes != (1..=assignments.len() as u8).collect()
+        || assignments
+            .iter()
+            .any(|assignment| assignment.driver_id <= 0)
+        || assignments
+            .iter()
+            .map(|assignment| assignment.driver_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != assignments.len()
+    {
+        Err(StoreError::InvalidHeatAssignments)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_tournament(connection: &Connection, id: i64) -> Result<(), StoreError> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tournaments WHERE id = ?1)",
+        [id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::TournamentNotFound(id))
+    }
+}
+
+fn tournament_started(connection: &Connection, tournament_id: i64) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM tournament_heats heat
+                JOIN race_events event ON event.race_id = heat.race_id
+                WHERE heat.tournament_id = ?1 AND event.event_type = 'official_start'
+            )",
+            [tournament_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn load_tournament(connection: &Connection, id: i64) -> Result<Tournament, StoreError> {
+    let name = connection
+        .query_row("SELECT name FROM tournaments WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::TournamentNotFound(id),
+            error => StoreError::Sqlite(error),
+        })?;
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT id, position, race_id FROM tournament_heats WHERE tournament_id = ?1 ORDER BY position",
+        )?;
+        statement
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut heats = Vec::with_capacity(rows.len());
+    for (heat_id, position, race_id) in rows {
+        let assignments = load_assignments(connection, heat_id)?;
+        let results = race_id
+            .as_deref()
+            .map(|race_id| current_results(connection, race_id, &assignments))
+            .transpose()?;
+        heats.push(TournamentHeat {
+            id: heat_id,
+            position,
+            assignments,
+            race_id,
+            results,
+        });
+    }
+    Ok(Tournament { id, name, heats })
+}
+
+fn load_assignments(
+    connection: &Connection,
+    heat_id: i64,
+) -> Result<Vec<HeatAssignment>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT lane, driver_id FROM tournament_heat_assignments WHERE heat_id = ?1 ORDER BY lane",
+    )?;
+    statement
+        .query_map([heat_id], |row| {
+            Ok(HeatAssignment {
+                lane: row.get(0)?,
+                driver_id: row.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(StoreError::from)
+}
+
+fn current_results(
+    connection: &Connection,
+    race_id: &str,
+    assignments: &[HeatAssignment],
+) -> Result<Vec<RaceResult>, StoreError> {
+    let events = load_events(connection, race_id)?;
+    let state = replay(&events)?.state().clone();
+    Ok(state
+        .standings()
+        .into_iter()
+        .enumerate()
+        .map(|(index, standing)| RaceResult {
+            position: index as u8 + 1,
+            lane: standing.lane,
+            driver_id: assignments
+                .iter()
+                .find(|assignment| assignment.lane == standing.lane)
+                .map(|assignment| assignment.driver_id),
+            corrected_laps_thousandths: standing.corrected_laps_thousandths,
+            result_time_ms: standing.result_time_ms,
+            best_lap_ms: state.lane(standing.lane).and_then(|lane| lane.best_lap_ms),
+        })
+        .collect())
 }
 
 fn validate_active_drivers(
@@ -441,7 +779,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn race_protocol_connections_use_wal_and_full_synchronous() {
+    fn sqlite_connections_use_wal_full_synchronous_and_foreign_keys() {
         let dir = tempdir().unwrap();
         let store = SqliteStore::open(dir.path().join("lapx.db")).unwrap();
         let connection = store.connect().unwrap();
@@ -451,8 +789,12 @@ mod tests {
         let synchronous: i64 = connection
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
+        let foreign_keys: bool = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
 
         assert_eq!(journal_mode, "wal");
         assert_eq!(synchronous, 2); // SQLite FULL
+        assert!(foreign_keys);
     }
 }
