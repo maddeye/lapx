@@ -14,6 +14,105 @@ fn lapxd_rejects_non_loopback_local_bind() {
     assert!(stderr.contains("loopback"), "stderr: {stderr}");
 }
 
+#[tokio::test]
+async fn local_surface_rejects_dns_rebinding_hosts() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use lapx::{
+        http::{local_router, local_server_router},
+        runtime::RaceRuntime,
+        store::SqliteStore,
+    };
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = RaceRuntime::new(
+        SqliteStore::open(dir.path().join("lapx.db")).unwrap(),
+        "race",
+    )
+    .await
+    .unwrap();
+    for host in [
+        "attacker.example:39123",
+        "localhost.attacker.example",
+        "localhost..",
+        "192.168.1.2",
+        "attacker@localhost",
+        "localhost:evil",
+        "localhost:65536",
+        "[::1]evil",
+    ] {
+        let response = local_router(runtime.clone())
+            .oneshot(
+                Request::get("/api/state")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{host}");
+    }
+    let absolute = Request::get("http://attacker.example/control")
+        .header("host", "localhost")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        local_server_router(runtime.clone())
+            .oneshot(absolute)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    let mut duplicate = Request::get("/control").body(Body::empty()).unwrap();
+    duplicate
+        .headers_mut()
+        .append("host", "localhost".parse().unwrap());
+    duplicate
+        .headers_mut()
+        .append("host", "attacker.example".parse().unwrap());
+    assert_eq!(
+        local_router(runtime.clone())
+            .oneshot(duplicate)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    assert_eq!(
+        local_server_router(runtime.clone())
+            .oneshot(Request::get("/control").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    for host in [
+        "localhost:39123",
+        "localhost.",
+        "127.0.0.1:39123",
+        "127.2.3.4",
+        "[::1]:39123",
+    ] {
+        let response = local_server_router(runtime.clone())
+            .oneshot(
+                Request::get("/control")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+    }
+}
+
 mod control_assets {
     use axum::{
         body::Body,
