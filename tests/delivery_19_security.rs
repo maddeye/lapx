@@ -41,6 +41,8 @@ async fn local_surface_rejects_dns_rebinding_hosts() {
         "192.168.1.2",
         "attacker@localhost",
         "localhost:evil",
+        "localhost:+80",
+        "localhost:-80",
         "localhost:65536",
         "[::1]evil",
     ] {

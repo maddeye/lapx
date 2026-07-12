@@ -116,7 +116,9 @@ fn loopback_authority(value: &str) -> bool {
     let Ok(authority) = value.parse::<Authority>() else {
         return false;
     };
-    if authority.port().is_some() && authority.port_u16().is_none() {
+    if authority.port().is_some_and(|port| {
+        !port.as_str().bytes().all(|byte| byte.is_ascii_digit()) || authority.port_u16().is_none()
+    }) {
         return false;
     }
     let canonical = authority.port().map_or_else(
