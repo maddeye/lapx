@@ -8,21 +8,21 @@ use lapx::{
     store::SqliteStore,
 };
 use std::sync::Arc;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use tower::ServiceExt;
 
-async fn runtime() -> Arc<RaceRuntime> {
+async fn runtime() -> (TempDir, Arc<RaceRuntime>) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    std::mem::forget(dir);
-    RaceRuntime::new(SqliteStore::open(path).unwrap(), "race")
+    let runtime = RaceRuntime::new(SqliteStore::open(path).unwrap(), "race")
         .await
-        .unwrap()
+        .unwrap();
+    (dir, runtime)
 }
 
 #[tokio::test]
 async fn serves_static_rennscreen() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
     let response = public_router(runtime.clone())
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await
@@ -61,7 +61,7 @@ async fn serves_static_rennscreen() {
 
 #[tokio::test]
 async fn asset_routes_are_read_only_and_do_not_leak() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
     let missing = public_router(runtime.clone())
         .oneshot(
             Request::get("/_app/does-not-exist.js")
@@ -88,7 +88,7 @@ async fn asset_routes_are_read_only_and_do_not_leak() {
 
 #[tokio::test]
 async fn local_router_also_serves_rennscreen() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
     let response = local_router(runtime)
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await

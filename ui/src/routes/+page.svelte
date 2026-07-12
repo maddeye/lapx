@@ -1,19 +1,46 @@
 <script>
 	import { onMount } from 'svelte';
-	import { connectState, formatMs, phaseText } from '$lib/state.js';
+	import {
+		createStateClient,
+		connectState,
+		displayRaceElapsed,
+		displayProtocolNow,
+		formatMs,
+		phaseText
+	} from '$lib/state.js';
 	import LaneTable from '$lib/LaneTable.svelte';
 
 	let snapshot = $state(null);
 	let connection = $state('verbinde …');
+	let connected = $state(false);
+	let receivedAt = $state(0);
+	let disconnectedAt = $state(null);
+	let clock = $state(0);
 
-	onMount(() =>
-		connectState(
-			(next) => (snapshot = next),
-			(status) => (connection = status)
-		)
-	);
+	onMount(() => {
+		clock = performance.now();
+		const client = createStateClient((next) => {
+			snapshot = next.snapshot;
+			connection = next.connection;
+			connected = next.connected;
+			receivedAt = next.receivedAt;
+			disconnectedAt = next.disconnectedAt;
+		});
+		const { stop } = connectState(client);
+		const timer = setInterval(() => (clock = performance.now()), 50);
+		return () => {
+			clearInterval(timer);
+			stop();
+		};
+	});
 
 	const lanes = $derived(snapshot?.state?.lanes ?? []);
+	const raceElapsed = $derived(
+		displayRaceElapsed(snapshot, receivedAt, connected, clock, disconnectedAt)
+	);
+	const protocolNow = $derived(
+		displayProtocolNow(snapshot, receivedAt, connected, clock, disconnectedAt)
+	);
 </script>
 
 <svelte:head>
@@ -28,8 +55,8 @@
 			<span>Verbindung: {connection}</span>
 		</p>
 	</header>
-	<p class="race-time" aria-label="Rennzeit">{formatMs(snapshot?.race_elapsed_ms)}</p>
-	<LaneTable {lanes} />
+	<p class="race-time" aria-label="Rennzeit">{formatMs(raceElapsed)}</p>
+	<LaneTable {lanes} {snapshot} {protocolNow} />
 </main>
 
 <style>

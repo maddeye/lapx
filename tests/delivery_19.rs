@@ -9,7 +9,7 @@ use lapx::{
     store::SqliteStore,
 };
 use std::sync::Arc;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use tower::ServiceExt;
 
 fn config() -> RaceConfig {
@@ -25,19 +25,18 @@ fn config() -> RaceConfig {
     }
 }
 
-async fn runtime() -> Arc<RaceRuntime> {
+async fn runtime() -> (TempDir, Arc<RaceRuntime>) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("lapx.db");
-    // Keep the tempdir alive for the whole process; tests only need one db each.
-    std::mem::forget(dir);
-    RaceRuntime::new(SqliteStore::open(path).unwrap(), "race")
+    let runtime = RaceRuntime::new(SqliteStore::open(path).unwrap(), "race")
         .await
-        .unwrap()
+        .unwrap();
+    (dir, runtime)
 }
 
 #[tokio::test]
 async fn public_api_is_read_only() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
 
     // Every mutating or local-only route must be structurally absent.
     let denied_posts = [
@@ -86,7 +85,7 @@ async fn public_api_is_read_only() {
 
 #[tokio::test]
 async fn local_router_keeps_all_routes() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
     let response = local_router(runtime.clone())
         .oneshot(
             Request::post("/api/start")
@@ -114,10 +113,12 @@ async fn local_router_keeps_all_routes() {
 
 #[tokio::test]
 async fn state_reports_race_elapsed_ms() {
-    let runtime = runtime().await;
+    let (_dir, runtime) = runtime().await;
     let app = local_router(runtime.clone());
     let ready = state_json(&app).await;
     assert!(ready["race_elapsed_ms"].is_null());
+    assert_eq!(ready["race_clock_running"], false);
+    assert!(ready["protocol_now"].is_u64());
 
     let response = local_router(runtime.clone())
         .oneshot(
@@ -135,6 +136,8 @@ async fn state_reports_race_elapsed_ms() {
     let running = state_json(&app).await;
     let elapsed = running["race_elapsed_ms"].as_u64().unwrap();
     assert!(elapsed >= 100, "elapsed {elapsed} should have started");
+    assert_eq!(running["race_clock_running"], true);
+    assert!(running["protocol_now"].is_u64());
 }
 
 async fn state_json(app: &axum::Router) -> serde_json::Value {

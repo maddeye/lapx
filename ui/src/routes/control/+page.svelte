@@ -1,11 +1,31 @@
 <script>
 	import { onMount } from 'svelte';
-	import { connectState, postCommand, formatMs, phaseText } from '$lib/state.js';
+	import {
+		createStateClient,
+		connectState,
+		displayRaceElapsed,
+		displayProtocolNow,
+		postCommand,
+		formatMs,
+		phaseText
+	} from '$lib/state.js';
+	import {
+		startPayload,
+		sensorPayload,
+		raceChaosPayload,
+		laneChaosPayload,
+		correctionPayload
+	} from '$lib/control.js';
 	import LaneTable from '$lib/LaneTable.svelte';
 
 	let snapshot = $state(null);
 	let connection = $state('verbinde …');
+	let connected = $state(false);
 	let error = $state('');
+	let receivedAt = $state(0);
+	let disconnectedAt = $state(null);
+	let clock = $state(0);
+	let pending = $state(false);
 
 	let lanes = $state(2);
 	let startSequenceMs = $state(3000);
@@ -26,62 +46,67 @@
 	let correctionLane = $state(1);
 	let correctionLaps = $state('0');
 
-	onMount(() =>
-		connectState(
-			(next) => (snapshot = next),
-			(status) => (connection = status)
-		)
+	let accept = () => {};
+
+	onMount(() => {
+		clock = performance.now();
+		const client = createStateClient((next) => {
+			snapshot = next.snapshot;
+			connection = next.connection;
+			connected = next.connected;
+			receivedAt = next.receivedAt;
+			disconnectedAt = next.disconnectedAt;
+		});
+		const stream = connectState(client);
+		accept = stream.accept;
+		const timer = setInterval(() => (clock = performance.now()), 100);
+		return () => {
+			clearInterval(timer);
+			stream.stop();
+		};
+	});
+
+	const raceElapsed = $derived(
+		displayRaceElapsed(snapshot, receivedAt, connected, clock, disconnectedAt)
+	);
+	const protocolNow = $derived(
+		displayProtocolNow(snapshot, receivedAt, connected, clock, disconnectedAt)
 	);
 
-	function consequence(kind, ms, key) {
-		return kind === 'abort' ? 'abort' : { [key]: Number(ms) };
-	}
-
 	async function run(action) {
+		if (pending) return;
+		pending = true;
 		error = '';
 		try {
-			snapshot = await action();
+			accept(await action());
 		} catch (failure) {
 			error = failure.message;
+		} finally {
+			pending = false;
 		}
 	}
 
-	const start = () =>
-		run(() =>
-			postCommand('/api/start', {
-				config: {
-					lanes: Number(lanes),
-					start_sequence_ms: Number(startSequenceMs),
-					restart_sequence_ms: Number(restartSequenceMs),
-					minimum_lap_time_ms: Number(minimumLapTimeMs),
-					finish_condition:
-						finishKind === 'laps'
-							? { laps: Number(finishLaps) }
-							: { time_ms: Number(finishTimeMs) },
-					finish_mode: finishMode,
-					false_start_consequence:
-						falseStartKind === 'abort'
-							? 'abort'
-							: consequence(falseStartKind, falseStartMs, falseStartKind),
-					chaos_consequence:
-						chaosKind === 'abort' ? 'abort' : consequence(chaosKind, chaosMs, chaosKind)
-				}
-			})
-		);
+	const start = () => run(() => postCommand('/api/start', startPayload({
+		lanes,
+		startSequenceMs,
+		restartSequenceMs,
+		minimumLapTimeMs,
+		finishKind,
+		finishLaps,
+		finishTimeMs,
+		finishMode,
+		falseStartKind,
+		falseStartMs,
+		chaosKind,
+		chaosMs
+	})));
 	const pause = () => run(() => postCommand('/api/pause'));
 	const resume = () => run(() => postCommand('/api/resume'));
-	const raceChaos = () => run(() => postCommand('/api/chaos', { source: 'race_control' }));
-	const laneChaos = () =>
-		run(() => postCommand('/api/chaos', { source: { lane: Number(chaosLane) } }));
-	const sensor = () =>
-		run(() => postCommand('/api/sensor', { lane: Number(sensorLane), edge: sensorEdge }));
+	const raceChaos = () => run(() => postCommand('/api/chaos', raceChaosPayload()));
+	const laneChaos = () => run(() => postCommand('/api/chaos', laneChaosPayload(chaosLane)));
+	const sensor = () => run(() => postCommand('/api/sensor', sensorPayload(sensorLane, sensorEdge)));
 	const correct = () =>
-		run(() =>
-			postCommand('/api/correct-laps', {
-				lane: Number(correctionLane),
-				delta_thousandths: Math.round(Number(correctionLaps.replace(',', '.')) * 1000)
-			})
-		);
+		run(() => postCommand('/api/correct-laps', correctionPayload(correctionLane, correctionLaps)));
 </script>
 
 <svelte:head>
@@ -92,7 +117,7 @@
 	<h1>Rennleitung</h1>
 	<p aria-live="polite">
 		<span>Phase: {phaseText(snapshot)}</span>
-		<span>Rennzeit: {formatMs(snapshot?.race_elapsed_ms)}</span>
+		<span>Rennzeit: {formatMs(raceElapsed)}</span>
 		<span>Verbindung: {connection}</span>
 	</p>
 	{#if error}
@@ -162,22 +187,22 @@
 					</label>
 				{/if}
 			</div>
-			<button type="submit">Rennen starten</button>
+			<button type="submit" disabled={pending}>Rennen starten</button>
 		</form>
 	</section>
 
 	<section aria-labelledby="control-heading">
 		<h2 id="control-heading">Rennsteuerung</h2>
 		<div class="row">
-			<button type="button" onclick={pause}>Rennpause</button>
-			<button type="button" onclick={resume}>Wiederanlauf</button>
-			<button type="button" onclick={raceChaos}>Chaos Rennleitung</button>
+			<button type="button" disabled={pending} onclick={pause}>Rennpause</button>
+			<button type="button" disabled={pending} onclick={resume}>Wiederanlauf</button>
+			<button type="button" disabled={pending} onclick={raceChaos}>Chaos Rennleitung</button>
 		</div>
 		<div class="row">
 			<label>Chaos-Bahn
 				<input type="number" min="1" max="4" bind:value={chaosLane} />
 			</label>
-			<button type="button" onclick={laneChaos}>Chaos Bahn auslösen</button>
+			<button type="button" disabled={pending} onclick={laneChaos}>Chaos Bahn auslösen</button>
 		</div>
 	</section>
 
@@ -193,7 +218,7 @@
 					<option value="falling">fallend</option>
 				</select>
 			</label>
-			<button type="button" onclick={sensor}>Messereignis senden</button>
+			<button type="button" disabled={pending} onclick={sensor}>Messereignis senden</button>
 		</div>
 	</section>
 
@@ -206,13 +231,13 @@
 			<label>Runden (auch Bruchteile, z.&nbsp;B. 0,5)
 				<input type="text" inputmode="decimal" bind:value={correctionLaps} />
 			</label>
-			<button type="button" onclick={correct}>Korrektur anwenden</button>
+			<button type="button" disabled={pending} onclick={correct}>Korrektur anwenden</button>
 		</div>
 	</section>
 
 	<section aria-labelledby="state-heading">
 		<h2 id="state-heading">Rennstand</h2>
-		<LaneTable lanes={snapshot?.state?.lanes ?? []} />
+		<LaneTable lanes={snapshot?.state?.lanes ?? []} {snapshot} {protocolNow} />
 	</section>
 </main>
 

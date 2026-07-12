@@ -45,7 +45,18 @@ async fn post(app: &Router, path: &str, body: serde_json::Value) -> serde_json::
         "POST {path}: {}",
         String::from_utf8_lossy(&bytes)
     );
-    serde_json::from_slice(&bytes).unwrap()
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // Every command response carries the full HttpState display schema.
+    assert!(json["protocol_now"].is_u64(), "POST {path} protocol_now");
+    assert!(
+        json["race_clock_running"].is_boolean(),
+        "POST {path} race_clock_running"
+    );
+    assert!(
+        json.as_object().unwrap().contains_key("race_elapsed_ms"),
+        "POST {path} race_elapsed_ms"
+    );
+    json
 }
 
 #[tokio::test]

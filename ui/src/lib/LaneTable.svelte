@@ -1,7 +1,7 @@
 <script>
-	import { formatMs, formatLaps } from '$lib/state.js';
+	import { formatMs, formatLaps, currentLapMs } from '$lib/state.js';
 
-	let { lanes = [] } = $props();
+	let { lanes = [], snapshot = null, protocolNow = null } = $props();
 </script>
 
 <table>
@@ -12,6 +12,7 @@
 			<th scope="col">Runden</th>
 			<th scope="col">Korrigierte Runden</th>
 			<th scope="col">Letzte Runde</th>
+			<th scope="col">Aktuelle Runde</th>
 			<th scope="col">Beste Runde</th>
 		</tr>
 	</thead>
@@ -22,6 +23,7 @@
 				<td class="numeric">{lane.laps}</td>
 				<td class="numeric">{formatLaps(lane.corrected_laps_thousandths)}</td>
 				<td class="numeric">{formatMs(lane.last_lap_ms)}</td>
+				<td class="numeric">{formatMs(currentLapMs(snapshot, lane, protocolNow))}</td>
 				<td class="numeric">{formatMs(lane.best_lap_ms)}</td>
 			</tr>
 		{/each}
