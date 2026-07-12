@@ -4,6 +4,7 @@ use crate::{
     runtime::{RaceRuntime, RuntimeError, StateSnapshot},
     store::{
         CompletedRace, Driver, DriverStats, EloSummary, HeatAssignment, StoreError, Tournament,
+        TournamentGenerationMode,
     },
 };
 use async_stream::stream;
@@ -44,6 +45,7 @@ pub fn local_router(runtime: Arc<RaceRuntime>) -> Router {
         .route("/api/driver-stats", get(driver_stats))
         .route("/api/elo", get(elo))
         .route("/api/tournaments", get(tournaments).post(create_tournament))
+        .route("/api/tournaments/generate", post(generate_tournament))
         .route("/api/tournaments/{id}", get(tournament))
         .route("/api/tournaments/{id}/heats", post(append_heat))
         .route(
@@ -119,6 +121,15 @@ struct TournamentNameInput {
 }
 
 #[derive(Deserialize)]
+struct GeneratedTournamentInput {
+    name: String,
+    driver_ids: Vec<i64>,
+    lane_count: u8,
+    mode: TournamentGenerationMode,
+    seed: u64,
+}
+
+#[derive(Deserialize)]
 struct HeatInput {
     assignments: Vec<HeatAssignment>,
 }
@@ -175,6 +186,26 @@ async fn create_tournament(
     let store = runtime.store();
     Ok(Json(
         store_task(move || store.create_tournament(&input.name)).await?,
+    ))
+}
+
+async fn generate_tournament(
+    State(runtime): State<Arc<RaceRuntime>>,
+    input: Result<Json<GeneratedTournamentInput>, JsonRejection>,
+) -> Result<Json<Tournament>, HttpError> {
+    let input = parse(input)?;
+    let store = runtime.store();
+    Ok(Json(
+        store_task(move || {
+            store.create_generated_tournament(
+                &input.name,
+                &input.driver_ids,
+                input.lane_count,
+                input.mode,
+                input.seed,
+            )
+        })
+        .await?,
     ))
 }
 
@@ -421,6 +452,7 @@ impl IntoResponse for HttpError {
                 StoreError::InvalidDriverName
                 | StoreError::DriverNotActive(_)
                 | StoreError::InvalidTournamentName
+                | StoreError::InvalidTournamentGeneration
                 | StoreError::InvalidHeatAssignments
                 | StoreError::RaceAssignmentsMismatch,
             )
@@ -456,6 +488,9 @@ impl IntoResponse for HttpError {
             Self::Store(StoreError::InvalidDriverName) => "display_name must not be blank".into(),
             Self::Store(StoreError::DriverNotFound(id)) => format!("driver {id} not found"),
             Self::Store(StoreError::InvalidTournamentName) => "name must not be blank".into(),
+            Self::Store(StoreError::InvalidTournamentGeneration) => {
+                "select at least two different active drivers and 1 to 4 lanes".into()
+            }
             Self::Store(StoreError::TournamentNotFound(id)) => {
                 format!("tournament {id} not found")
             }

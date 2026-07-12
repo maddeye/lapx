@@ -1,5 +1,5 @@
 use crate::domain::{Command, DomainError, Event, RaceEngine, RaceState, RaceStatus};
-use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -83,10 +83,65 @@ pub struct TournamentHeat {
     pub results: Option<Vec<RaceResult>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TournamentGenerationMode {
+    Random,
+    EloBalanced,
+}
+
+impl TournamentGenerationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::EloBalanced => "elo_balanced",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "random" => Some(Self::Random),
+            "elo_balanced" => Some(Self::EloBalanced),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentGeneration {
+    pub mode: TournamentGenerationMode,
+    #[serde(with = "decimal_u64")]
+    pub seed: u64,
+    pub lane_count: u8,
+}
+
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Number(u64),
+            Decimal(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Number(value) => Ok(value),
+            Value::Decimal(value) => value.parse().map_err(D::Error::custom),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tournament {
     pub id: i64,
     pub name: String,
+    pub generation: Option<TournamentGeneration>,
     pub heats: Vec<TournamentHeat>,
 }
 
@@ -133,6 +188,7 @@ pub enum StoreError {
     DriverNotFound(i64),
     DriverNotActive(i64),
     InvalidTournamentName,
+    InvalidTournamentGeneration,
     TournamentNotFound(i64),
     HeatNotFound(i64),
     InvalidHeatAssignments,
@@ -208,6 +264,12 @@ impl SqliteStore {
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL CHECK (length(trim(name)) > 0)
             );
+            CREATE TABLE IF NOT EXISTS tournament_generation (
+                tournament_id INTEGER PRIMARY KEY REFERENCES tournaments(id),
+                mode TEXT NOT NULL CHECK (mode IN ('random', 'elo_balanced')),
+                seed TEXT NOT NULL,
+                lane_count INTEGER NOT NULL CHECK (lane_count BETWEEN 1 AND 4)
+            );
             CREATE TABLE IF NOT EXISTS tournament_heats (
                 id INTEGER PRIMARY KEY,
                 tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
@@ -222,6 +284,12 @@ impl SqliteStore {
                 PRIMARY KEY (heat_id, lane),
                 UNIQUE (heat_id, driver_id)
             );
+            CREATE TRIGGER IF NOT EXISTS tournament_generation_no_update
+            BEFORE UPDATE ON tournament_generation
+            BEGIN SELECT RAISE(ABORT, 'tournament generation is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS tournament_generation_no_delete
+            BEFORE DELETE ON tournament_generation
+            BEGIN SELECT RAISE(ABORT, 'tournament generation is immutable'); END;
             CREATE TRIGGER IF NOT EXISTS tournament_heat_order_immutable
             BEFORE UPDATE OF tournament_id, position ON tournament_heats
             BEGIN SELECT RAISE(ABORT, 'tournament heat order is immutable'); END;
@@ -351,72 +419,7 @@ impl SqliteStore {
     pub fn elo(&self) -> Result<EloSummary, StoreError> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
-        let mut ratings: BTreeMap<_, _> = load_drivers(&transaction)?
-            .into_iter()
-            .map(|driver| (driver.id, 1500))
-            .collect();
-        let mut completed = load_completed_races(&transaction)?;
-        // History is newest-first; Elo folds the durable completion order oldest-first.
-        completed.reverse();
-        let mut races = Vec::with_capacity(completed.len());
-
-        for race in completed {
-            let participants: Vec<_> = race
-                .results
-                .iter()
-                .filter(|result| result.driver_id.is_some())
-                .collect();
-            let mut deltas = if participants.len() < 2 {
-                Vec::new()
-            } else {
-                participants
-                    .iter()
-                    .map(|result| {
-                        let driver_id = result.driver_id.expect("assigned Fahrer has an id");
-                        let rating = *ratings.get(&driver_id).unwrap_or(&1500);
-                        let opponents = (participants.len() - 1) as f64;
-                        let (actual, expected) = participants
-                            .iter()
-                            .filter(|other| other.driver_id != result.driver_id)
-                            .fold((0.0, 0.0), |(actual, expected), other| {
-                                let other_rating = *ratings
-                                    .get(&other.driver_id.expect("assigned Fahrer has an id"))
-                                    .unwrap_or(&1500);
-                                (
-                                    actual + actual_score(result, other),
-                                    expected
-                                        + 1.0
-                                            / (1.0
-                                                + 10f64
-                                                    .powf((other_rating - rating) as f64 / 400.0)),
-                                )
-                            });
-                        EloDelta {
-                            driver_id,
-                            // Average first, then deterministically round the race delta once.
-                            delta: (32.0 * (actual / opponents - expected / opponents)).round()
-                                as i64,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            };
-            deltas.sort_by_key(|delta| delta.driver_id);
-            for delta in &deltas {
-                *ratings.entry(delta.driver_id).or_insert(1500) += delta.delta;
-            }
-            races.push(EloRaceDelta {
-                race_id: race.race_id,
-                deltas,
-            });
-        }
-
-        let summary = EloSummary {
-            ratings: ratings
-                .into_iter()
-                .map(|(driver_id, rating)| EloRating { driver_id, rating })
-                .collect(),
-            races,
-        };
+        let summary = derive_elo(&transaction)?;
         transaction.commit()?;
         Ok(summary)
     }
@@ -457,6 +460,55 @@ impl SqliteStore {
         Ok(tournament)
     }
 
+    pub fn create_generated_tournament(
+        &self,
+        name: &str,
+        driver_ids: &[i64],
+        lane_count: u8,
+        mode: TournamentGenerationMode,
+        seed: u64,
+    ) -> Result<Tournament, StoreError> {
+        let name = tournament_name(name)?;
+        let mut driver_ids = driver_ids.to_vec();
+        driver_ids.sort_unstable();
+        if driver_ids.len() < 2
+            || !(1..=4).contains(&lane_count)
+            || driver_ids.iter().any(|id| *id <= 0)
+            || driver_ids.windows(2).any(|ids| ids[0] == ids[1])
+        {
+            return Err(StoreError::InvalidTournamentGeneration);
+        }
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_active_drivers(
+            &transaction,
+            &driver_ids.iter().copied().map(Some).collect::<Vec<_>>(),
+        )?;
+        let heats = generate_heats(&transaction, &driver_ids, lane_count, mode, seed)?;
+
+        transaction.execute("INSERT INTO tournaments (name) VALUES (?1)", [name])?;
+        let id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO tournament_generation (tournament_id, mode, seed, lane_count) VALUES (?1, ?2, ?3, ?4)",
+            params![id, mode.as_str(), seed.to_string(), lane_count],
+        )?;
+        for (index, drivers) in heats.iter().enumerate() {
+            let assignments: Vec<_> = drivers
+                .iter()
+                .enumerate()
+                .map(|(lane, driver_id)| HeatAssignment {
+                    lane: lane as u8 + 1,
+                    driver_id: *driver_id,
+                })
+                .collect();
+            insert_heat(&transaction, id, index as u64 + 1, &assignments)?;
+        }
+        let tournament = load_tournament(&transaction, id)?;
+        transaction.commit()?;
+        Ok(tournament)
+    }
+
     pub fn append_heat(
         &self,
         tournament_id: i64,
@@ -481,17 +533,7 @@ impl SqliteStore {
             [tournament_id],
             |row| row.get(0),
         )?;
-        transaction.execute(
-            "INSERT INTO tournament_heats (tournament_id, position) VALUES (?1, ?2)",
-            params![tournament_id, position],
-        )?;
-        let heat_id = transaction.last_insert_rowid();
-        for assignment in assignments {
-            transaction.execute(
-                "INSERT INTO tournament_heat_assignments (heat_id, lane, driver_id) VALUES (?1, ?2, ?3)",
-                params![heat_id, assignment.lane, assignment.driver_id],
-            )?;
-        }
+        insert_heat(&transaction, tournament_id, position as u64, assignments)?;
         let tournament = load_tournament(&transaction, tournament_id)?;
         transaction.commit()?;
         Ok(tournament)
@@ -648,6 +690,73 @@ fn load_completed_races(connection: &Connection) -> Result<Vec<CompletedRace>, S
     Ok(races)
 }
 
+fn derive_elo(connection: &Connection) -> Result<EloSummary, StoreError> {
+    let mut ratings: BTreeMap<_, _> = load_drivers(connection)?
+        .into_iter()
+        .map(|driver| (driver.id, 1500))
+        .collect();
+    let mut completed = load_completed_races(connection)?;
+    // History is newest-first; Elo folds the durable completion order oldest-first.
+    completed.reverse();
+    let mut races = Vec::with_capacity(completed.len());
+
+    for race in completed {
+        let participants: Vec<_> = race
+            .results
+            .iter()
+            .filter(|result| result.driver_id.is_some())
+            .collect();
+        let mut deltas = if participants.len() < 2 {
+            Vec::new()
+        } else {
+            participants
+                .iter()
+                .map(|result| {
+                    let driver_id = result.driver_id.expect("assigned Fahrer has an id");
+                    let rating = *ratings.get(&driver_id).unwrap_or(&1500);
+                    let opponents = (participants.len() - 1) as f64;
+                    let (actual, expected) = participants
+                        .iter()
+                        .filter(|other| other.driver_id != result.driver_id)
+                        .fold((0.0, 0.0), |(actual, expected), other| {
+                            let other_rating = *ratings
+                                .get(&other.driver_id.expect("assigned Fahrer has an id"))
+                                .unwrap_or(&1500);
+                            (
+                                actual + actual_score(result, other),
+                                expected
+                                    + 1.0
+                                        / (1.0
+                                            + 10f64.powf((other_rating - rating) as f64 / 400.0)),
+                            )
+                        });
+                    EloDelta {
+                        driver_id,
+                        // Average first, then deterministically round the race delta once.
+                        delta: (32.0 * (actual / opponents - expected / opponents)).round() as i64,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        deltas.sort_by_key(|delta| delta.driver_id);
+        for delta in &deltas {
+            *ratings.entry(delta.driver_id).or_insert(1500) += delta.delta;
+        }
+        races.push(EloRaceDelta {
+            race_id: race.race_id,
+            deltas,
+        });
+    }
+
+    Ok(EloSummary {
+        ratings: ratings
+            .into_iter()
+            .map(|(driver_id, rating)| EloRating { driver_id, rating })
+            .collect(),
+        races,
+    })
+}
+
 fn actual_score(result: &RaceResult, other: &RaceResult) -> f64 {
     let metric = |result: &RaceResult| {
         (
@@ -695,6 +804,86 @@ fn validate_heat_assignments(assignments: &[HeatAssignment]) -> Result<(), Store
     }
 }
 
+fn insert_heat(
+    connection: &Connection,
+    tournament_id: i64,
+    position: u64,
+    assignments: &[HeatAssignment],
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO tournament_heats (tournament_id, position) VALUES (?1, ?2)",
+        params![tournament_id, position],
+    )?;
+    let heat_id = connection.last_insert_rowid();
+    for assignment in assignments {
+        connection.execute(
+            "INSERT INTO tournament_heat_assignments (heat_id, lane, driver_id) VALUES (?1, ?2, ?3)",
+            params![heat_id, assignment.lane, assignment.driver_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn generate_heats(
+    connection: &Connection,
+    canonical_driver_ids: &[i64],
+    lane_count: u8,
+    mode: TournamentGenerationMode,
+    seed: u64,
+) -> Result<Vec<Vec<i64>>, StoreError> {
+    let mut rng = seed;
+    let ordered = match mode {
+        TournamentGenerationMode::Random => {
+            let mut drivers = canonical_driver_ids.to_vec();
+            // Fixed generation contract: SplitMix64, then one reverse Fisher-Yates shuffle.
+            for index in (1..drivers.len()).rev() {
+                let swap = (splitmix64(&mut rng) % (index as u64 + 1)) as usize;
+                drivers.swap(index, swap);
+            }
+            drivers
+        }
+        TournamentGenerationMode::EloBalanced => {
+            let ratings: BTreeMap<_, _> = derive_elo(connection)?
+                .ratings
+                .into_iter()
+                .map(|rating| (rating.driver_id, rating.rating))
+                .collect();
+            let mut drivers: Vec<_> = canonical_driver_ids
+                .iter()
+                .map(|id| (*id, *ratings.get(id).unwrap_or(&1500), splitmix64(&mut rng)))
+                .collect();
+            drivers.sort_by_key(|(id, rating, tie)| (std::cmp::Reverse(*rating), *tie, *id));
+            drivers.into_iter().map(|(id, _, _)| id).collect()
+        }
+    };
+
+    let lanes = lane_count as usize;
+    if mode == TournamentGenerationMode::Random {
+        return Ok(ordered.chunks(lanes).map(<[_]>::to_vec).collect());
+    }
+    let heat_count = ordered.len().div_ceil(lanes);
+    let mut heats = vec![Vec::new(); heat_count];
+    for (index, driver_id) in ordered.into_iter().enumerate() {
+        let row = index / heat_count;
+        let offset = index % heat_count;
+        let heat = if row % 2 == 0 {
+            offset
+        } else {
+            heat_count - 1 - offset
+        };
+        heats[heat].push(driver_id);
+    }
+    Ok(heats)
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 fn require_tournament(connection: &Connection, id: i64) -> Result<(), StoreError> {
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM tournaments WHERE id = ?1)",
@@ -731,6 +920,31 @@ fn load_tournament(connection: &Connection, id: i64) -> Result<Tournament, Store
             rusqlite::Error::QueryReturnedNoRows => StoreError::TournamentNotFound(id),
             error => StoreError::Sqlite(error),
         })?;
+    let generation = connection
+        .query_row(
+            "SELECT mode, seed, lane_count FROM tournament_generation WHERE tournament_id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u8>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(mode, seed, lane_count)| -> Result<_, StoreError> {
+            Ok(TournamentGeneration {
+                mode: TournamentGenerationMode::from_str(&mode).ok_or_else(|| {
+                    StoreError::CorruptProtocol(format!("invalid tournament mode {mode}"))
+                })?,
+                seed: seed.parse().map_err(|_| {
+                    StoreError::CorruptProtocol(format!("invalid tournament seed {seed}"))
+                })?,
+                lane_count,
+            })
+        })
+        .transpose()?;
     let rows = {
         let mut statement = connection.prepare(
             "SELECT id, position, race_id FROM tournament_heats WHERE tournament_id = ?1 ORDER BY position",
@@ -760,7 +974,12 @@ fn load_tournament(connection: &Connection, id: i64) -> Result<Tournament, Store
             results,
         });
     }
-    Ok(Tournament { id, name, heats })
+    Ok(Tournament {
+        id,
+        name,
+        generation,
+        heats,
+    })
 }
 
 fn load_assignments(

@@ -20,6 +20,11 @@
 	let selectedTournament = $state(initialSelectedTournament);
 	let displayName = $state('');
 	let tournamentName = $state('');
+	let generatedName = $state('');
+	let generatedDriverIds = $state([]);
+	let generatedLanes = $state(2);
+	let generatedMode = $state('random');
+	let generatedSeed = $state('0');
 	let heatLanes = $state(2);
 	let heatDriverIds = $state(['', '', '', '']);
 	let pending = $state(false);
@@ -29,7 +34,7 @@
 		const response = await fetch(path, {
 			method: body === undefined ? 'GET' : 'POST',
 			headers: body === undefined ? {} : { 'content-type': 'application/json' },
-			body: body === undefined ? undefined : JSON.stringify(body)
+			body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body)
 		});
 		if (!response.ok) throw new Error((await response.text()) || `Fehler ${response.status}`);
 		return response.json();
@@ -83,6 +88,17 @@
 		tournaments = [...tournaments, tournament];
 		selectedTournament = tournament;
 		tournamentName = '';
+	});
+	const generateTournament = () => run(async () => {
+		if (!/^\d+$/.test(generatedSeed) || BigInt(generatedSeed) > 18446744073709551615n) {
+			throw new Error('Seed muss eine Zahl von 0 bis 18446744073709551615 sein');
+		}
+		const body = `{"name":${JSON.stringify(generatedName)},"driver_ids":${JSON.stringify(generatedDriverIds)},"lane_count":${generatedLanes},"mode":${JSON.stringify(generatedMode)},"seed":${generatedSeed}}`;
+		const tournament = await request('/api/tournaments/generate', body);
+		tournaments = [...tournaments, tournament];
+		selectedTournament = tournament;
+		generatedName = '';
+		generatedDriverIds = [];
 	});
 	const openTournament = (id) => run(async () => selectTournament(await request(`/api/tournaments/${id}`)));
 	const appendHeat = () => run(async () => {
@@ -157,6 +173,32 @@
 			</label>
 			<button type="submit" disabled={pending}>Turnier anlegen</button>
 		</form>
+		<form onsubmit={(event) => (event.preventDefault(), generateTournament())}>
+			<label>Name des generierten Turniers
+				<input required bind:value={generatedName} />
+			</label>
+			<fieldset>
+				<legend>Fahrer auswählen</legend>
+				{#each activeDrivers as driver (driver.id)}
+					<label class="checkbox"><input type="checkbox" value={driver.id} bind:group={generatedDriverIds} /> {driver.display_name}</label>
+				{/each}
+			</fieldset>
+			<label>Generierungsmodus
+				<select bind:value={generatedMode}>
+					<option value="random">Zufällig</option>
+					<option value="elo_balanced">Elo-ausgeglichen</option>
+				</select>
+			</label>
+			<label>Seed (0 bis 18446744073709551615)
+				<input required inputmode="numeric" pattern="[0-9]+" bind:value={generatedSeed} />
+			</label>
+			<label>Bahnen pro Lauf
+				<select bind:value={generatedLanes}>
+					{#each [1, 2, 3, 4] as count}<option value={count}>{count}</option>{/each}
+				</select>
+			</label>
+			<button type="submit" disabled={pending || generatedDriverIds.length < 2}>Turnier generieren</button>
+		</form>
 		{#if tournaments.length === 0}
 			<p>Keine Turniere vorhanden.</p>
 		{:else}
@@ -172,6 +214,9 @@
 
 		{#if selectedTournament}
 			<h3>{selectedTournament.name}: Läufe</h3>
+			{#if selectedTournament.generation}
+				<p>Generiert: {selectedTournament.generation.mode === 'random' ? 'Zufällig' : 'Elo-ausgeglichen'} · Seed {selectedTournament.generation.seed} · {selectedTournament.generation.lane_count} Bahnen</p>
+			{/if}
 			<form onsubmit={(event) => (event.preventDefault(), appendHeat())}>
 				<label>Bahnen
 					<select bind:value={heatLanes}>
@@ -286,6 +331,8 @@
 	li { padding: 0.75rem 0; border-top: 1px solid #bbb; }
 	form { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem; }
 	label { display: flex; flex-direction: column; gap: 0.25rem; }
+	fieldset { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+	.checkbox { flex-direction: row; align-items: center; }
 	input, select, button { font: inherit; padding: 0.4em 0.6em; }
 	button { cursor: pointer; }
 	table { width: 100%; border-collapse: collapse; }
