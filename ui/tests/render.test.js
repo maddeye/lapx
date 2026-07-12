@@ -73,7 +73,7 @@ test('admin page renders Fahrer and flat tournament controls', async () => {
 	const tournament = {
 		id: 3,
 		name: 'Sommer-Cup',
-		generation: { mode: 'elo_balanced', seed: 42, lane_count: 2 },
+		generation: { mode: 'elo_balanced', seed: '42', lane_count: 2 },
 		heats: [{
 			id: 9,
 			position: 1,
